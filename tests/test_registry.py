@@ -1,5 +1,6 @@
 import json
 import platform
+import shutil
 
 import pandas as pd
 import pytest
@@ -24,61 +25,131 @@ class FakePipeline:
         self.tag = tag
 
 
-METADATA = {
-    "model_version": "20260101-000000-abc123",
-    "numeric_features": ["a"],
-    "categorical_features": ["c"],
-}
+def _metadata(version: str = "20260101-000000-abc123", **extra) -> dict:
+    return {
+        "model_version": version,
+        "numeric_features": ["a"],
+        "categorical_features": ["c"],
+        **extra,
+    }
+
+
+METADATA = _metadata()
 REFERENCE = pd.DataFrame({"a": [1, 2, 3], "c": ["x", "y", "x"]})
 
 
 @pytest.fixture()
 def store(tmp_path) -> LocalModelStore:
-    return LocalModelStore(tmp_path / "models")
+    return LocalModelStore(tmp_path / "models", keep_versions=3)
+
+
+def _publish(store: LocalModelStore, version: str) -> str:
+    metadata = _metadata(version, trained_at=f"t-{version}")
+    return store.save(FakePipeline(version), metadata, REFERENCE)
+
+
+def test_save_fallido_no_deja_staging_ni_version(store):
+    _publish(store, "v1")
+    with pytest.raises(Exception, match="pickle"):
+        store.save(lambda x: x, _metadata("v2"), REFERENCE)  # una lambda no se puede serializar
+    assert store.list_versions() == ["v1"]
+    assert store.current_version() == "v1"
+    assert not list(store.versions_dir.glob(".staging-*"))
+
+
+def test_prune_sin_puntero_conserva_las_mas_recientes(store):
+    for v in ["v1", "v2", "v3", "v4"]:
+        _publish(store, v)
+    store.current_file.unlink()
+    store.keep_versions = 2
+    assert store.prune() == ["v2"]
+    assert store.list_versions() == ["v3", "v4"]
+    assert store.current_version() is None
+
+
+# ------------------------------------------------------------------ layout y publicacion
 
 
 def test_load_sin_artefactos_lanza_filenotfound(store):
     assert not store.exists()
+    assert store.current_version() is None
     with pytest.raises(FileNotFoundError, match="Ejecuta antes el entrenamiento"):
         store.load()
 
 
-def test_save_crea_el_directorio_y_los_tres_ficheros(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
+def test_save_publica_una_version_y_la_deja_en_servicio(store):
+    version = _publish(store, "v1")
+    assert version == "v1"
     assert store.exists()
-    assert store.missing_files() == []
-    assert sorted(p.name for p in store.model_dir.iterdir()) == sorted(ARTIFACT_FILES)
+    assert store.current_version() == "v1"
+    assert store.current_file.read_text().strip() == "v1"
+    assert sorted(p.name for p in store.version_dir("v1").iterdir()) == sorted(ARTIFACT_FILES)
+    assert store.model_path == store.version_dir("v1") / "model.joblib"
 
 
 def test_save_no_deja_residuos_de_staging(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
-    store.save(FakePipeline("v2"), {**METADATA, "model_version": "v2"}, REFERENCE)
-    assert not list(store.model_dir.glob(".staging-*"))
+    _publish(store, "v1")
+    _publish(store, "v2")
+    assert not list(store.versions_dir.glob(".staging-*"))
     assert not list(store.model_dir.glob("*.tmp"))
 
 
 def test_roundtrip(store):
-    store.save(FakePipeline("v1"), METADATA, REFERENCE)
+    _publish(store, "v1")
     loaded = store.load()
     assert isinstance(loaded, LoadedModel)
     assert loaded.pipeline.tag == "v1"
-    assert loaded.metadata == METADATA
-    assert loaded.version == METADATA["model_version"]
+    assert loaded.metadata["model_version"] == "v1"
+    assert loaded.version == "v1"
     assert loaded.feature_columns == ["a", "c"]
     pd.testing.assert_frame_equal(loaded.reference, REFERENCE)
 
 
-def test_save_sobrescribe_la_version_anterior(store):
-    store.save(FakePipeline("v1"), METADATA, REFERENCE)
-    store.save(FakePipeline("v2"), {**METADATA, "model_version": "v2"}, REFERENCE.head(1))
-    loaded = store.load()
-    assert loaded.pipeline.tag == "v2"
-    assert loaded.version == "v2"
-    assert len(loaded.reference) == 1
+def test_cada_save_crea_una_version_nueva_y_apunta_a_la_ultima(store):
+    _publish(store, "v1")
+    _publish(store, "v2")
+    assert store.list_versions() == ["v1", "v2"]
+    assert store.current_version() == "v2"
+    assert store.load().pipeline.tag == "v2"
+    assert store.load("v1").pipeline.tag == "v1"
+
+
+def test_republicar_la_misma_version_la_sustituye(store):
+    _publish(store, "v1")
+    store.save(FakePipeline("v1-bis"), _metadata("v1"), REFERENCE.head(1))
+    assert store.list_versions() == ["v1"]
+    assert store.load().pipeline.tag == "v1-bis"
+    assert len(store.load().reference) == 1
+
+
+def test_retencion_poda_las_mas_antiguas(store):
+    for v in ["v1", "v2", "v3", "v4"]:
+        _publish(store, v)
+    assert store.list_versions() == ["v2", "v3", "v4"]  # keep_versions=3
+    assert not store.version_dir("v1").exists()
+
+
+def test_retencion_nunca_borra_la_version_en_servicio(store):
+    _publish(store, "v1")
+    _publish(store, "v2")
+    store.set_current("v1")
+    store.keep_versions = 1
+    assert store.prune() == []  # v1 es la actual: se conserva aunque exceda la ventana
+    assert store.list_versions() == ["v1", "v2"]
+    store.set_current("v2")
+    assert store.prune() == ["v1"]
+    assert store.list_versions() == ["v2"]
+
+
+def test_las_versiones_se_ordenan_por_fecha_de_entrenamiento_no_por_nombre(store):
+    store.save(FakePipeline("b"), _metadata("zzz", trained_at="2026-01-01T00:00:00"), REFERENCE)
+    store.save(FakePipeline("a"), _metadata("aaa", trained_at="2026-01-02T00:00:00"), REFERENCE)
+    assert store.list_versions() == ["zzz", "aaa"]
+    assert store.rollback() == "zzz"
 
 
 def test_exists_requiere_el_juego_completo(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
+    _publish(store, "v1")
     store.reference_path.unlink()
     assert not store.exists()
     assert store.missing_files() == ["reference.csv"]
@@ -86,8 +157,43 @@ def test_exists_requiere_el_juego_completo(store):
         store.load()
 
 
+def test_exists_de_una_version_concreta(store):
+    _publish(store, "v1")
+    assert store.exists("v1") and not store.exists("v9")
+    assert store.missing_files("v9") == list(ARTIFACT_FILES)
+
+
+# ------------------------------------------------------------------ layout plano (1.0)
+
+
+def test_layout_plano_se_carga_y_migra_al_siguiente_save(store, tmp_path):
+    legacy = LocalModelStore(tmp_path / "legacy")
+    _publish(store, "old")
+    legacy.model_dir.mkdir()
+    for name in ARTIFACT_FILES:
+        shutil.copy(store.version_dir("old") / name, legacy.model_dir / name)
+
+    assert legacy.has_legacy_layout()
+    assert legacy.current_version() is None
+    assert legacy.exists()
+    assert legacy.metadata_path == legacy.model_dir / "metadata.json"
+    assert legacy.load().pipeline.tag == "old"
+    assert legacy.describe_versions() == []
+
+    legacy.save_metadata({**_metadata("old"), "mlflow_run_id": "r1"})  # va al fichero plano
+    assert json.loads((legacy.model_dir / "metadata.json").read_text())["mlflow_run_id"] == "r1"
+
+    _publish(legacy, "new")
+    assert legacy.current_version() == "new"
+    assert legacy.load().pipeline.tag == "new"
+    assert legacy.load("new").version == "new"
+
+
+# ------------------------------------------------------------------ artefactos corruptos
+
+
 def test_metadata_corrupto(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
+    _publish(store, "v1")
     store.metadata_path.write_text("{no es json", encoding="utf-8")
     with pytest.raises(ModelArtifactError, match="metadata.json ilegible"):
         store.load()
@@ -100,24 +206,85 @@ def test_metadata_incompleto(store):
 
 
 def test_metadata_no_es_un_objeto(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
+    _publish(store, "v1")
     store.metadata_path.write_text("[1, 2, 3]", encoding="utf-8")
     with pytest.raises(ModelArtifactError, match="incompleto"):
         store.load()
 
 
 def test_modelo_corrupto(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
+    _publish(store, "v1")
     store.model_path.write_bytes(b"\x00\x01basura")
     with pytest.raises(ModelArtifactError, match="model.joblib corrupto"):
         store.load()
 
 
 def test_reference_ilegible(store):
-    store.save(FakePipeline(), METADATA, REFERENCE)
+    _publish(store, "v1")
     store.reference_path.write_text("", encoding="utf-8")
     with pytest.raises(ModelArtifactError, match="reference.csv ilegible"):
         store.load()
+
+
+def test_save_metadata_actualiza_solo_metadata(store):
+    _publish(store, "v1")
+    store.save_metadata({**_metadata("v1"), "mlflow_run_id": "run-1"})
+    loaded = store.load()
+    assert loaded.metadata["mlflow_run_id"] == "run-1"
+    assert loaded.pipeline.tag == "v1"
+    assert json.loads(store.metadata_path.read_text())["mlflow_run_id"] == "run-1"
+    assert not list(store.version_dir("v1").glob("*.tmp"))
+
+
+# ------------------------------------------------------------------ rollback
+
+
+def test_rollback_por_defecto_vuelve_a_la_anterior(store):
+    for v in ["v1", "v2", "v3"]:
+        _publish(store, v)
+    assert store.rollback() == "v2"
+    assert store.current_version() == "v2"
+    assert store.load().pipeline.tag == "v2"
+    assert store.rollback() == "v1"  # anterior a la actual, no a la ultima publicada
+
+
+def test_rollback_a_una_version_concreta_en_cualquier_direccion(store):
+    for v in ["v1", "v2", "v3"]:
+        _publish(store, v)
+    assert store.rollback("v1") == "v1"
+    assert store.rollback("v3") == "v3"
+
+
+def test_rollback_sin_anterior_o_desconocida(store):
+    with pytest.raises(LookupError, match="No hay una version anterior"):
+        store.rollback()
+    _publish(store, "v1")
+    with pytest.raises(LookupError, match="No hay una version anterior"):
+        store.rollback()
+    with pytest.raises(LookupError, match="Version desconocida: v9"):
+        store.rollback("v9")
+    assert store.current_version() == "v1"
+
+
+def test_rollback_a_version_incompleta_no_mueve_el_puntero(store):
+    _publish(store, "v1")
+    _publish(store, "v2")
+    (store.version_dir("v1") / "model.joblib").unlink()
+    with pytest.raises(ModelArtifactError, match="incompleta"):
+        store.rollback()
+    assert store.current_version() == "v2"
+
+
+def test_describe_versions(store):
+    _publish(store, "v1")
+    _publish(store, "v2")
+    (store.version_dir("v1") / "metadata.json").write_text("{roto", encoding="utf-8")
+    described = store.describe_versions()
+    assert [d["version"] for d in described] == ["v1", "v2"]
+    assert described[1] == {
+        "version": "v2", "current": True, "complete": True, "trained_at": "t-v2", "roc_auc": None,
+    }
+    assert described[0]["current"] is False and described[0]["trained_at"] is None
 
 
 # ------------------------------------------------------------------ compatibilidad
@@ -186,13 +353,3 @@ def test_compatibilidad_python_distinto_solo_avisa():
     runtime = {**runtime_versions(), "python": _bump_minor(platform.python_version())}
     warnings = verify_compatibility(_compatible_metadata(runtime=runtime))
     assert len(warnings) == 1 and "Python del modelo" in warnings[0]
-
-
-def test_save_metadata_actualiza_solo_metadata(store):
-    store.save(FakePipeline("v1"), METADATA, REFERENCE)
-    store.save_metadata({**METADATA, "mlflow_run_id": "run-1"})
-    loaded = store.load()
-    assert loaded.metadata["mlflow_run_id"] == "run-1"
-    assert loaded.pipeline.tag == "v1"
-    assert json.loads(store.metadata_path.read_text())["mlflow_run_id"] == "run-1"
-    assert not list(store.model_dir.glob("*.tmp"))

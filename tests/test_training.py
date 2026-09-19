@@ -28,12 +28,34 @@ def test_entrenamiento_genera_artefactos(tmp_path):
     df = generate_dataset(n_rows=2000, seed=11)
     metadata = train(df, model_dir=str(tmp_path), seed=11)
 
-    assert (tmp_path / "model.joblib").exists()
-    assert (tmp_path / "metadata.json").exists()
-    assert (tmp_path / "reference.csv").exists()
+    store = LocalModelStore(tmp_path)
+    assert store.exists()
+    assert store.current_version() == metadata["model_version"]
+    version_dir = Path(tmp_path) / "versions" / metadata["model_version"]
+    assert (version_dir / "model.joblib").exists()
+    assert (version_dir / "metadata.json").exists()
+    assert (version_dir / "reference.csv").exists()
 
-    persisted = json.loads(Path(tmp_path / "metadata.json").read_text())
+    persisted = json.loads(store.metadata_path.read_text())
     assert persisted["model_version"] == metadata["model_version"]
+
+
+def test_cada_entrenamiento_publica_una_version_y_conserva_las_anteriores(tmp_path, train_small):
+    primero = train_small(tmp_path, seed=12)
+    segundo = train_small(tmp_path, seed=13)
+    store = LocalModelStore(tmp_path)
+    assert store.list_versions() == [primero["model_version"], segundo["model_version"]]
+    assert store.current_version() == segundo["model_version"]
+    assert store.load(primero["model_version"]).metadata["seed"] == 12
+
+
+def test_retencion_de_versiones_sale_de_settings(tmp_path, monkeypatch, train_small):
+    monkeypatch.setattr(
+        train_module, "get_settings", lambda: Settings(_env_file=None, model_keep_versions=1)
+    )
+    train_small(tmp_path, seed=14)
+    ultimo = train_small(tmp_path, seed=15)
+    assert LocalModelStore(tmp_path).list_versions() == [ultimo["model_version"]]
 
 
 def test_metricas_minimas_de_calidad(tmp_path):
@@ -91,9 +113,10 @@ def test_gate_de_calidad_no_sobrescribe_artefactos_anteriores(tmp_path, train_sm
     bueno = train_small(tmp_path, seed=23)
     with pytest.raises(ModelQualityError, match="por debajo del minimo"):
         train(generate_dataset(1200, seed=24), model_dir=str(tmp_path), seed=24, min_roc_auc=0.999)
-    persisted = json.loads((tmp_path / "metadata.json").read_text())
-    assert persisted["model_version"] == bueno["model_version"]
-    assert not list(tmp_path.glob(".staging-*"))
+    store = LocalModelStore(tmp_path)
+    assert json.loads(store.metadata_path.read_text())["model_version"] == bueno["model_version"]
+    assert store.list_versions() == [bueno["model_version"]]
+    assert not list(store.versions_dir.glob(".staging-*"))
 
 
 def test_gate_de_calidad_en_directorio_vacio_no_crea_nada(tmp_path):
@@ -212,7 +235,7 @@ def test_mlflow_caido_no_tumba_el_entrenamiento(tmp_path, monkeypatch, train_sma
     _settings_con_mlflow(monkeypatch)
     _install_fake_mlflow(monkeypatch, fail=True)
     metadata = train_small(tmp_path, seed=30)
-    assert (tmp_path / "model.joblib").exists()
+    assert LocalModelStore(tmp_path).exists()
     assert metadata["mlflow_run_id"] is None
     assert "Fallo al registrar en MLflow" in caplog.text
     assert "mlflow caido" in caplog.text
@@ -225,7 +248,7 @@ def test_mlflow_ok_registra_run_alias_y_lo_persiste(tmp_path, monkeypatch, train
 
     assert metadata["mlflow_run_id"] == "run-xyz"
     assert metadata["mlflow_model_version"] == "3"
-    persisted = json.loads((tmp_path / "metadata.json").read_text())
+    persisted = json.loads(LocalModelStore(tmp_path).metadata_path.read_text())
     assert persisted["mlflow_run_id"] == "run-xyz"
     assert persisted["mlflow_model_version"] == "3"
     assert calls["uri"] == "http://mlflow.test:5000"
@@ -285,7 +308,7 @@ def test_mlflow_alias_desactivado_por_configuracion(tmp_path, monkeypatch, train
 def test_cli_entrena_y_devuelve_0(tmp_path, capsys):
     code = main(["--rows", "800", "--seed", "5", "--model-dir", str(tmp_path)])
     assert code == 0
-    assert (tmp_path / "model.joblib").exists()
+    assert LocalModelStore(tmp_path).exists()
     assert "Entrenamiento OK" in capsys.readouterr().out
 
 
@@ -293,4 +316,4 @@ def test_cli_gate_fallido_devuelve_2_sin_artefactos(tmp_path):
     argv = ["--rows", "800", "--seed", "5", "--model-dir", str(tmp_path), "--min-auc", "0.999"]
     code = main(argv)
     assert code == 2
-    assert not (tmp_path / "model.joblib").exists()
+    assert not LocalModelStore(tmp_path).exists()

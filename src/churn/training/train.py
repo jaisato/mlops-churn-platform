@@ -90,8 +90,9 @@ def train(
     `ModelQualityError` si el AUC no alcanza `min_roc_auc` (por defecto
     `CHURN_MIN_ROC_AUC`); en ambos casos no se toca el directorio del modelo.
     """
+    settings = get_settings()
     if min_roc_auc is None:
-        min_roc_auc = get_settings().min_roc_auc
+        min_roc_auc = settings.min_roc_auc
 
     report = validate_training_data(df)
     if not report.is_valid:
@@ -141,10 +142,12 @@ def train(
         "mlflow_model_version": None,
     }
 
-    store = LocalModelStore(model_dir)
+    store = LocalModelStore(model_dir, keep_versions=settings.model_keep_versions)
     reference = x_train.sample(n=min(REFERENCE_SAMPLE_SIZE, len(x_train)), random_state=seed)
     store.save(pipeline, metadata, reference)
-    logger.info("Modelo guardado en %s | metricas: %s", model_dir, metrics)
+    logger.info(
+        "Version %s publicada en %s | metricas: %s", metadata["model_version"], model_dir, metrics
+    )
 
     tracking = _maybe_log_to_mlflow(pipeline, metadata, x_test.head(5))
     if tracking:

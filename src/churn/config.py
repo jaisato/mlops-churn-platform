@@ -1,6 +1,7 @@
 """Configuracion 12-factor. Prefijo de entorno: CHURN_."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,8 @@ class Settings(BaseSettings):
 
     # Artefactos del modelo (volumen compartido entre trainer y api)
     model_dir: str = "models"
+    # Versiones publicadas que se conservan en model_dir/versions (la actual nunca se borra)
+    model_keep_versions: int = Field(default=5, ge=1)
 
     # MLflow (opcional): si esta definido, el entrenamiento registra runs y modelo
     mlflow_tracking_uri: str = ""
@@ -45,6 +48,10 @@ class Settings(BaseSettings):
     drift_min_rows: int = Field(default=200, ge=2)
     drift_buffer_size: int = Field(default=5000, ge=2)
     psi_alert_threshold: float = Field(default=0.2, gt=0.0)
+    # Donde viven las predicciones recientes: "sqlite" (persistente, compartido entre
+    # procesos; fichero drift_db_path o <model_dir>/drift.sqlite) o "memory" (por proceso)
+    drift_store: Literal["sqlite", "memory"] = "sqlite"
+    drift_db_path: str = ""
 
     # Token para operaciones administrativas (p. ej. /model/reload)
     admin_token: str = "cambia-este-token"

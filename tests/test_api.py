@@ -1,6 +1,7 @@
 import json
 
 from churn.data.generator import FEATURE_COLUMNS, generate_dataset
+from churn.registry import LocalModelStore
 from churn.serving.main import risk_level
 from tests.conftest import ADMIN_HEADERS
 
@@ -112,12 +113,24 @@ def test_predict_batch_limites(client):
     assert client.post("/predict/batch", json=demasiados).status_code == 422
 
 
-def test_predict_alimenta_el_buffer_con_version(client):
+def test_predict_alimenta_el_almacen_con_version(client):
     version = client.post("/predict", json=CUSTOMER).json()["model_version"]
-    ultimo = client.app.state.buffer[-1]
+    ultimo = client.app.state.predictions.recent(1).iloc[0].to_dict()
     assert ultimo["model_version"] == version
     assert 0 <= ultimo["churn_probability"] <= 1
     assert all(ultimo[k] == v for k, v in CUSTOMER.items())
+
+
+def test_almacen_sqlite_sobrevive_al_reinicio_de_la_api(client_factory):
+    primero, model_dir = client_factory(seed=91)
+    for _ in range(6):
+        primero.post("/predict", json=CUSTOMER)
+    assert primero.get("/monitoring/drift").json()["n_current"] == 6
+
+    reiniciado, _ = client_factory(model_dir=model_dir, train_model=False)  # otro proceso/arranque
+    assert reiniciado.get("/monitoring/drift").json()["n_current"] == 6
+    reiniciado.post("/predict", json=CUSTOMER_FIEL)
+    assert primero.get("/monitoring/drift").json()["n_current"] == 7  # comparten el fichero
 
 
 def test_risk_level_umbrales_inclusivos():
@@ -188,11 +201,9 @@ def test_reload_carga_nueva_version(client_factory, train_small):
 
 
 def test_reload_sin_artefactos_404_y_conserva_modelo(client_factory, tmp_path):
-    from pathlib import Path
-
     c, model_dir = client_factory(seed=43)
     v1 = c.get("/health").json()["model_version"]
-    (Path(model_dir) / "reference.csv").unlink()
+    LocalModelStore(model_dir).reference_path.unlink()
 
     resp = c.post("/model/reload", headers=ADMIN_HEADERS)
 
@@ -203,11 +214,9 @@ def test_reload_sin_artefactos_404_y_conserva_modelo(client_factory, tmp_path):
 
 
 def test_reload_con_metadata_corrupta_500_y_conserva_modelo(client_factory):
-    from pathlib import Path
-
     c, model_dir = client_factory(seed=44)
     v1 = c.get("/health").json()["model_version"]
-    (Path(model_dir) / "metadata.json").write_text("{corrupto", encoding="utf-8")
+    LocalModelStore(model_dir).metadata_path.write_text("{corrupto", encoding="utf-8")
 
     resp = c.post("/model/reload", headers=ADMIN_HEADERS)
 
@@ -217,12 +226,9 @@ def test_reload_con_metadata_corrupta_500_y_conserva_modelo(client_factory):
 
 
 def test_reload_rechaza_modelo_con_otras_features(client_factory):
-    import json
-    from pathlib import Path
-
     c, model_dir = client_factory(seed=45)
     v1 = c.get("/health").json()["model_version"]
-    meta_path = Path(model_dir) / "metadata.json"
+    meta_path = LocalModelStore(model_dir).metadata_path
     metadata = json.loads(meta_path.read_text())
     metadata["numeric_features"] = metadata["numeric_features"][:-1]  # el codigo espera una mas
     meta_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -237,11 +243,9 @@ def test_reload_rechaza_modelo_con_otras_features(client_factory):
 def test_arranque_rechaza_sklearn_incompatible_salvo_en_modo_permisivo(
     client_factory, train_small, tmp_path
 ):
-    import json
-
     model_dir = tmp_path / "viejo"
     train_small(model_dir, seed=46)
-    meta_path = model_dir / "metadata.json"
+    meta_path = LocalModelStore(model_dir).metadata_path
     metadata = json.loads(meta_path.read_text())
     metadata["runtime"]["scikit_learn"] = "0.24.2"
     meta_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -261,15 +265,140 @@ def test_arranque_con_artefactos_corruptos_sirve_503_y_reload_recupera(
 ):
     model_dir = tmp_path / "corrupto"
     train_small(model_dir, seed=51)
-    (model_dir / "metadata.json").write_text("{x", encoding="utf-8")
+    LocalModelStore(model_dir).metadata_path.write_text("{x", encoding="utf-8")
 
     c, _ = client_factory(model_dir=model_dir, train_model=False)
     assert c.get("/health").status_code == 503
     assert c.post("/predict", json=CUSTOMER).status_code == 503
 
-    train_small(model_dir, seed=51)  # reparamos los artefactos
+    train_small(model_dir, seed=51)  # publica una version nueva y sana
     assert c.post("/model/reload", headers=ADMIN_HEADERS).status_code == 200
     assert c.get("/health").status_code == 200
+
+
+# --------------------------------------------------------------------------- versiones y rollback
+
+
+def test_model_versions_lista_las_publicadas(client_factory, train_small):
+    c, model_dir = client_factory(seed=81)
+    v1 = c.get("/health").json()["model_version"]
+    v2 = train_small(model_dir, seed=82)["model_version"]
+
+    body = c.get("/model/versions").json()
+    assert body["current"] == v2  # el almacen ya apunta a la nueva...
+    assert body["serving"] == v1  # ...pero este proceso sigue sirviendo la anterior hasta el reload
+    assert [v["version"] for v in body["versions"]] == [v1, v2]
+    assert body["versions"][1] == {
+        "version": v2, "current": True, "complete": True,
+        "trained_at": body["versions"][1]["trained_at"], "roc_auc": body["versions"][1]["roc_auc"],
+    }
+    assert body["versions"][1]["roc_auc"] > 0.5
+
+
+def test_model_versions_sin_modelo(client_sin_modelo):
+    body = client_sin_modelo.get("/model/versions").json()
+    assert body == {"current": None, "serving": None, "versions": []}
+
+
+def test_rollback_vuelve_a_la_version_anterior(client_factory, train_small):
+    c, model_dir = client_factory(seed=83)
+    v1 = c.get("/health").json()["model_version"]
+    train_small(model_dir, seed=84)
+    v2 = c.post("/model/reload", headers=ADMIN_HEADERS).json()["model_version"]
+    assert v2 != v1
+
+    resp = c.post("/model/rollback", headers=ADMIN_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"model_version": v1, "previous_version": v2, "available_versions": [v1, v2]}
+    assert c.get("/health").json()["model_version"] == v1
+    assert c.post("/predict", json=CUSTOMER).json()["model_version"] == v1
+    assert LocalModelStore(model_dir).current_version() == v1
+    assert c.get("/model/versions").json()["current"] == v1
+
+
+def test_rollback_a_una_version_concreta(client_factory, train_small):
+    c, model_dir = client_factory(seed=85)
+    v1 = c.get("/health").json()["model_version"]
+    v2 = train_small(model_dir, seed=86)["model_version"]
+    v3 = train_small(model_dir, seed=87)["model_version"]
+
+    assert c.post("/model/rollback", json={"version": v2}, headers=ADMIN_HEADERS).status_code == 200
+    assert c.get("/health").json()["model_version"] == v2
+    assert c.post("/model/rollback", json={"version": v3}, headers=ADMIN_HEADERS).status_code == 200
+    assert c.get("/health").json()["model_version"] == v3
+    assert v1 in c.post("/model/rollback", json={"version": v1}, headers=ADMIN_HEADERS).json()[
+        "available_versions"
+    ]
+
+
+def test_rollback_errores(client_factory):
+    c, model_dir = client_factory(seed=88)
+    v1 = c.get("/health").json()["model_version"]
+
+    assert c.post("/model/rollback").status_code == 401
+    sin_anterior = c.post("/model/rollback", headers=ADMIN_HEADERS)
+    assert sin_anterior.status_code == 409
+    assert "No hay una version anterior" in sin_anterior.json()["detail"]
+    desconocida = c.post("/model/rollback", json={"version": "nope"}, headers=ADMIN_HEADERS)
+    assert desconocida.status_code == 404
+    assert c.get("/health").json()["model_version"] == v1
+
+
+def test_rollback_a_version_corrupta_no_toca_puntero_ni_servicio(client_factory, train_small):
+    c, model_dir = client_factory(seed=89)
+    v1 = c.get("/health").json()["model_version"]
+    train_small(model_dir, seed=90)
+    v2 = c.post("/model/reload", headers=ADMIN_HEADERS).json()["model_version"]
+    store = LocalModelStore(model_dir)
+    (store.version_dir(v1) / "model.joblib").write_bytes(b"basura")
+
+    resp = c.post("/model/rollback", headers=ADMIN_HEADERS)
+
+    assert resp.status_code == 500
+    assert v1 in resp.json()["detail"]
+    assert store.current_version() == v2
+    assert c.get("/health").json()["model_version"] == v2
+
+
+def test_rollback_a_version_incompleta_devuelve_500_sin_tocar_nada(client_factory, train_small):
+    c, model_dir = client_factory(seed=98)
+    v1 = c.get("/health").json()["model_version"]
+    train_small(model_dir, seed=99)
+    v2 = c.post("/model/reload", headers=ADMIN_HEADERS).json()["model_version"]
+    store = LocalModelStore(model_dir)
+    (store.version_dir(v1) / "reference.csv").unlink()
+
+    resp = c.post("/model/rollback", headers=ADMIN_HEADERS)
+
+    assert resp.status_code == 500
+    assert "incompleta" in resp.json()["detail"]
+    assert store.current_version() == v2
+    assert c.get("/health").json()["model_version"] == v2
+
+
+def test_retencion_de_versiones_via_api(client_factory, train_small):
+    c, model_dir = client_factory(seed=92, model_keep_versions=2)
+    for seed in (93, 94, 95):
+        train_small(model_dir, seed=seed)
+    # el trainer usa sus propios settings (defecto 5), asi que podamos desde el almacen de la API
+    c.app.state.store.prune()
+    assert len(c.get("/model/versions").json()["versions"]) == 2
+
+
+def test_drift_de_predicciones_tras_rollback_solo_cuenta_la_version_servida(
+    client_factory, train_small
+):
+    c, model_dir = client_factory(seed=96)  # drift_min_rows=5
+    train_small(model_dir, seed=97)
+    c.post("/model/reload", headers=ADMIN_HEADERS)
+    for _ in range(5):
+        c.post("/predict", json=CUSTOMER)
+    assert c.get("/monitoring/drift").json()["predictions"] is not None
+
+    c.post("/model/rollback", headers=ADMIN_HEADERS)
+    assert c.get("/monitoring/drift").json()["predictions"] is None
 
 
 # --------------------------------------------------------------------------- drift

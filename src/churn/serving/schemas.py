@@ -88,6 +88,34 @@ class ReloadResponse(BaseModel):
     previous_version: str | None = None
 
 
+class ModelVersionInfo(BaseModel):
+    version: str
+    current: bool
+    complete: bool
+    trained_at: str | None = None
+    roc_auc: float | None = None
+
+
+class ModelVersionsResponse(BaseModel):
+    current: str | None = Field(None, description="Version apuntada por `current` en el almacen")
+    serving: str | None = Field(None, description="Version cargada en memoria en este proceso")
+    versions: list[ModelVersionInfo]
+
+
+class RollbackRequest(BaseModel):
+    version: str | None = Field(
+        None, description="Version a la que volver; por defecto la anterior a la actual"
+    )
+
+
+class RollbackResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_version: str
+    previous_version: str | None = None
+    available_versions: list[str]
+
+
 class HealthResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 

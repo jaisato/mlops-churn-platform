@@ -13,9 +13,17 @@ ADMIN_HEADERS = {"X-Admin-Token": "token-test"}
 
 
 def make_settings(model_dir: str, **overrides) -> Settings:
-    """Settings hermeticos para tests: sin leer .env ni depender del entorno del runner."""
+    """Settings hermeticos para tests: sin leer .env ni depender del entorno del runner.
+
+    El almacen de predicciones por defecto es en memoria para que los clientes que
+    comparten el modelo de sesion no se vean las predicciones unos a otros.
+    """
     base = dict(
-        environment="test", model_dir=model_dir, drift_min_rows=10, admin_token="token-test"
+        environment="test",
+        model_dir=model_dir,
+        drift_min_rows=10,
+        drift_store="memory",
+        admin_token="token-test",
     )
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -57,9 +65,10 @@ def train_small():
 
 @pytest.fixture()
 def client_factory(tmp_path, train_small):
-    """Clientes con modelo y directorio propios (reload, artefactos corruptos, buffer...).
+    """Clientes con modelo y directorio propios (reload, rollback, artefactos corruptos...).
 
-    Devuelve `(client, model_dir)`. Los clientes se cierran al terminar el test.
+    Usan el almacen SQLite real dentro de su directorio. Devuelve `(client, model_dir)`;
+    los clientes se cierran al terminar el test.
     """
     stack = contextlib.ExitStack()
 
@@ -67,7 +76,7 @@ def client_factory(tmp_path, train_small):
         model_dir = str(model_dir or tmp_path / f"model-{seed}")
         if train_model:
             train_small(model_dir, seed=seed)
-        options = {"drift_min_rows": 5, **overrides}
+        options = {"drift_min_rows": 5, "drift_store": "sqlite", **overrides}
         app = create_app(make_settings(model_dir, **options))
         client = stack.enter_context(TestClient(app, raise_server_exceptions=False))
         return client, model_dir
