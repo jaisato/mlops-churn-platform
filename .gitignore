@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+data/local/
+data/*.csv
+mlruns/
+models/
+.last_tag
+.current_tag
+.previous_tag
+# Metadatos de Windows al copiar ficheros descargados a WSL
+*:Zone.Identifier
+# Permisos locales de Claude Code (por maquina)
+.claude/settings.local.json
+# Backups y datos locales de verificacion
+backup/

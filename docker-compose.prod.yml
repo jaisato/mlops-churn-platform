@@ -1,0 +1,74 @@
+# PRODUCCION (VPS netcup). Imagenes desde GHCR; reentrenar = perfil "train".
+# Variables obligatorias en .env: GITHUB_OWNER, CHURN_ADMIN_TOKEN, VPN_BIND_IP (ver .env.example).
+services:
+  api:
+    image: ghcr.io/${GITHUB_OWNER:?definir}/mlops-churn-platform:${TAG:-latest}
+    ports:
+      - "127.0.0.1:8010:8000"
+    environment:
+      CHURN_ENVIRONMENT: production   # exige un CHURN_ADMIN_TOKEN seguro al arrancar
+      CHURN_MODEL_DIR: /models
+      CHURN_ADMIN_TOKEN: ${CHURN_ADMIN_TOKEN:?definir}
+    volumes:
+      - models:/models
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    deploy:
+      resources:
+        limits: { memory: 1500m }
+
+  trainer:
+    image: ghcr.io/${GITHUB_OWNER:?definir}/mlops-churn-platform:${TAG:-latest}
+    profiles: ["train"]
+    command: python -m churn.training.train --rows 50000 --model-dir /models
+    environment:
+      CHURN_MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - models:/models
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    # La UI se sirve tras Caddy en /mlflow/ (strip_prefix). NO anadir --static-prefix:
+    # moveria las rutas ajax-api bajo /mlflow y Caddy las dejaria sin prefijo (404).
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2.8
+    # Docker publica puertos saltandose ufw: sin IP de bind explicita, 80/443 quedarian
+    # expuestos a Internet aunque el firewall los deniegue. Por eso VPN_BIND_IP es obligatoria.
+    ports:
+      - "${VPN_BIND_IP:?definir (IP del VPS en la VPN, p. ej. 10.8.0.1)}:443:443"
+      - "${VPN_BIND_IP:?definir (IP del VPS en la VPN, p. ej. 10.8.0.1)}:80:80"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  models:
+  mlflow-data:
+  caddy-data:

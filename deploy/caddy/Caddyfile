@@ -1,0 +1,25 @@
+# TLS interno para la red privada VPN. La API y MLflow quedan tras el proxy.
+{
+    auto_https disable_redirects
+}
+
+:443 {
+    tls internal
+    encode gzip
+
+    # La UI de MLflow usa rutas relativas (static-files/, ajax-api/), asi que basta con
+    # quitar el prefijo. Sin barra final los assets se resolverian contra "/" (la API):
+    # redirigimos /mlflow -> /mlflow/.
+    redir /mlflow /mlflow/ permanent
+    handle /mlflow/* {
+        uri strip_prefix /mlflow
+        reverse_proxy mlflow:5000
+    }
+    handle {
+        reverse_proxy api:8000
+    }
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}

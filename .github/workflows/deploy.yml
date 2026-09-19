@@ -1,0 +1,96 @@
+name: Release y despliegue (VPS netcup via VPN)
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag de imagen a desplegar (p. ej. v1.0.0 o 1.0.0; por defecto latest)"
+        required: false
+        default: "latest"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mlops-churn-platform
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login en GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadatos de imagen (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest` se publica en cada release (tag v*) y en builds manuales desde la rama
+          # por defecto. Con `{{is_default_branch}}` a secas nunca se publicaba en releases
+          # (un tag no es una rama) y `TAG=latest` no encontraba imagen que descargar.
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref_name == github.event.repository.default_branch }}
+
+      - name: Build y push a GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment: production
+    concurrency: deploy-production
+    steps:
+      - name: Levantar tunel WireGuard hacia la red privada de netcup
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y wireguard-tools
+          umask 077
+          echo "${{ secrets.WG_CONFIG }}" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo wg-quick up wg0
+          ping -c 2 ${{ secrets.DEPLOY_HOST }} || true
+
+      - name: Preparar clave SSH
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Desplegar en el VPS (docker compose pull + up + healthcheck)
+        run: |
+          VERSION="${{ github.event.inputs.tag || needs.build-push.outputs.version }}"
+          VERSION="${VERSION#v}"   # las imagenes se etiquetan sin la "v" (semver)
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "cd /opt/mlops-churn-platform && TAG=$VERSION ./deploy/scripts/deploy.sh"
+
+      - name: Smoke test post-despliegue
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "curl -fsS --max-time 10 http://localhost:8010/health" \
+            && echo 'Despliegue verificado'
+
+      - name: Cerrar tunel VPN
+        if: always()
+        run: sudo wg-quick down wg0 || true
