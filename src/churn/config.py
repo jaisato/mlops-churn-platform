@@ -27,9 +27,15 @@ class Settings(BaseSettings):
     mlflow_tracking_uri: str = ""
     mlflow_experiment: str = "churn"
     mlflow_registered_model: str = "churn-classifier"
+    # Alias que se asigna en el Model Registry a cada version que supera el gate ("" = no asignar)
+    mlflow_champion_alias: str = "champion"
 
     # Gate de calidad: el entrenamiento NO publica artefactos si el AUC queda por debajo
     min_roc_auc: float = Field(default=0.75, ge=0.5, le=1.0)
+
+    # Si es True, la API rechaza cargar un modelo entrenado con otra version menor de
+    # scikit-learn (los pickles no son portables); las features incompatibles se rechazan siempre
+    strict_artifact_compat: bool = True
 
     # Umbrales de negocio para clasificar el riesgo (bajo < medium <= medio < high <= alto)
     risk_medium: float = Field(default=0.35, ge=0.0, le=1.0)

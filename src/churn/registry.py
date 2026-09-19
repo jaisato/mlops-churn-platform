@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -24,6 +25,9 @@ from typing import Any
 
 import joblib
 import pandas as pd
+import sklearn
+
+from churn.data.generator import FEATURE_COLUMNS
 
 MODEL_FILE = "model.joblib"
 METADATA_FILE = "metadata.json"
@@ -34,6 +38,73 @@ REQUIRED_METADATA_KEYS = ("model_version", "numeric_features", "categorical_feat
 
 class ModelArtifactError(RuntimeError):
     """Artefactos ausentes, incompletos o corruptos en el directorio del modelo."""
+
+
+class ModelCompatibilityError(ModelArtifactError):
+    """Los artefactos existen pero este codigo/runtime no puede servirlos con garantias."""
+
+
+def _minor(version: str) -> str:
+    return ".".join(str(version).split(".")[:2])
+
+
+def verify_compatibility(
+    metadata: dict[str, Any],
+    *,
+    strict_runtime: bool = True,
+    expected_features: list[str] | None = None,
+) -> list[str]:
+    """Comprueba que el modelo puede servirse con el codigo y el runtime actuales.
+
+    Devuelve la lista de avisos (no bloqueantes). Lanza `ModelCompatibilityError` si las
+    features del modelo no son las que espera el contrato de la API, o si (en modo
+    estricto) el pipeline se serializo con otra version menor de scikit-learn: los
+    pickles no son portables entre versiones y el fallo seria silencioso.
+    """
+    expected = sorted(expected_features or FEATURE_COLUMNS)
+    actual = sorted(
+        list(metadata.get("numeric_features", [])) + list(metadata.get("categorical_features", []))
+    )
+    if actual != expected:
+        raise ModelCompatibilityError(
+            f"Las features del modelo {actual} no coinciden con las del codigo {expected}: "
+            "reentrena con esta version del codigo"
+        )
+
+    warnings: list[str] = []
+    runtime = metadata.get("runtime") or {}
+    if not runtime:
+        warnings.append(
+            "metadata sin versiones de runtime (modelo anterior a la 1.1): no se puede "
+            "comprobar la compatibilidad de scikit-learn"
+        )
+        return warnings
+
+    trained_sklearn = str(runtime.get("scikit_learn", ""))
+    current_sklearn = sklearn.__version__
+    if _minor(trained_sklearn) != _minor(current_sklearn):
+        message = (
+            f"scikit-learn del modelo ({trained_sklearn}) distinto del instalado "
+            f"({current_sklearn}); los pickles no son portables entre versiones menores"
+        )
+        if strict_runtime:
+            raise ModelCompatibilityError(
+                message + ". Reentrena o arranca con CHURN_STRICT_ARTIFACT_COMPAT=false"
+            )
+        warnings.append(message)
+    elif trained_sklearn != current_sklearn:
+        warnings.append(
+            f"scikit-learn con distinto parche: modelo {trained_sklearn}, "
+            f"instalado {current_sklearn}"
+        )
+
+    trained_python = str(runtime.get("python", ""))
+    if trained_python and _minor(trained_python) != _minor(platform.python_version()):
+        warnings.append(
+            f"Python del modelo ({trained_python}) distinto del actual "
+            f"({platform.python_version()})"
+        )
+    return warnings
 
 
 @dataclass(frozen=True)

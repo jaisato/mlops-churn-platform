@@ -75,7 +75,9 @@ class ModelInfoResponse(BaseModel):
     code_version: str | None = None
     seed: int | None = None
     quality_gate: QualityGate | None = None
+    runtime: dict[str, str] | None = None
     mlflow_run_id: str | None = None
+    mlflow_model_version: str | None = None
 
 
 class ReloadResponse(BaseModel):
@@ -92,6 +94,11 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     model_version: str | None = None
+
+
+class LivenessResponse(BaseModel):
+    status: Literal["alive"]
+    code_version: str
 
 
 class FeatureDrift(BaseModel):

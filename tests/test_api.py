@@ -45,6 +45,13 @@ def test_health_sin_modelo_503(client_sin_modelo):
     assert client_sin_modelo.get("/health").status_code == 503
 
 
+def test_health_live_responde_aunque_no_haya_modelo(client_sin_modelo):
+    resp = client_sin_modelo.get("/health/live")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "alive"
+    assert resp.json()["code_version"]
+
+
 def test_openapi_expone_todos_los_endpoints(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert {"/health", "/predict", "/predict/batch", "/model/info", "/model/reload",
@@ -144,6 +151,8 @@ def test_model_info_incluye_trazabilidad(client):
     assert body["seed"] == 7
     assert body["quality_gate"]["passed"] is True
     assert body["mlflow_run_id"] is None
+    assert body["mlflow_model_version"] is None
+    assert body["runtime"]["scikit_learn"]
     assert body["metrics"]["n_train"] == int(body["metrics"]["n_train"])  # enteros intactos
 
 
@@ -205,6 +214,46 @@ def test_reload_con_metadata_corrupta_500_y_conserva_modelo(client_factory):
     assert resp.status_code == 500
     assert "No se pudo cargar el modelo" in resp.json()["detail"]
     assert c.get("/health").json()["model_version"] == v1
+
+
+def test_reload_rechaza_modelo_con_otras_features(client_factory):
+    import json
+    from pathlib import Path
+
+    c, model_dir = client_factory(seed=45)
+    v1 = c.get("/health").json()["model_version"]
+    meta_path = Path(model_dir) / "metadata.json"
+    metadata = json.loads(meta_path.read_text())
+    metadata["numeric_features"] = metadata["numeric_features"][:-1]  # el codigo espera una mas
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    resp = c.post("/model/reload", headers=ADMIN_HEADERS)
+
+    assert resp.status_code == 500
+    assert "features del modelo" in resp.json()["detail"]
+    assert c.get("/health").json()["model_version"] == v1
+
+
+def test_arranque_rechaza_sklearn_incompatible_salvo_en_modo_permisivo(
+    client_factory, train_small, tmp_path
+):
+    import json
+
+    model_dir = tmp_path / "viejo"
+    train_small(model_dir, seed=46)
+    meta_path = model_dir / "metadata.json"
+    metadata = json.loads(meta_path.read_text())
+    metadata["runtime"]["scikit_learn"] = "0.24.2"
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    estricto, _ = client_factory(model_dir=model_dir, train_model=False)
+    assert estricto.get("/health").status_code == 503
+    assert estricto.get("/health/live").status_code == 200
+
+    permisivo, _ = client_factory(
+        model_dir=model_dir, train_model=False, strict_artifact_compat=False
+    )
+    assert permisivo.get("/health").status_code == 200
 
 
 def test_arranque_con_artefactos_corruptos_sirve_503_y_reload_recupera(

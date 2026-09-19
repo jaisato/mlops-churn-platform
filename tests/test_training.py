@@ -1,11 +1,13 @@
 import contextlib
 import json
+import platform
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import sklearn
 
 from churn import __version__
 from churn.config import Settings
@@ -17,6 +19,7 @@ from churn.training.train import (
     build_pipeline,
     main,
     new_model_version,
+    runtime_versions,
     train,
 )
 
@@ -65,11 +68,20 @@ def test_metadata_contiene_trazabilidad_completa(tmp_path, train_small):
     assert metadata["categorical_features"] == CATEGORICAL_FEATURES
     assert metadata["quality_gate"] == {"min_roc_auc": 0.75, "passed": True}
     assert metadata["mlflow_run_id"] is None
+    assert metadata["mlflow_model_version"] is None
+    assert metadata["runtime"]["scikit_learn"] == sklearn.__version__
+    assert metadata["runtime"]["python"] == platform.python_version()
+    assert set(metadata["runtime"]) == {"python", "scikit_learn", "numpy", "pandas"}
     assert metadata["metrics"]["n_train"] + metadata["metrics"]["n_test"] == 1200
     datetime.fromisoformat(metadata["trained_at"])  # ISO-8601 valido
     reference = LocalModelStore(tmp_path).load().reference
     assert list(reference.columns) == NUMERIC_FEATURES + CATEGORICAL_FEATURES
     assert len(reference) == metadata["metrics"]["n_train"]  # < 2000 -> toda la muestra
+
+
+def test_runtime_versions_son_cadenas_no_vacias():
+    versions = runtime_versions()
+    assert all(isinstance(v, str) and v for v in versions.values())
 
 
 # ------------------------------------------------------------------ gate de calidad
@@ -102,7 +114,7 @@ def test_gate_por_defecto_sale_de_settings(tmp_path, monkeypatch):
 
 
 def test_versiones_unicas_incluso_en_el_mismo_segundo():
-    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
     a, b = new_model_version(now), new_model_version(now)
     assert a != b
     assert a.startswith("20260102-030405-") and len(a) == len("20260102-030405-") + 6
@@ -124,7 +136,15 @@ class _FakeRun:
         self.info = types.SimpleNamespace(run_id=run_id)
 
 
-def _install_fake_mlflow(monkeypatch, *, fail: bool = False, run_id: str = "run-abc123") -> dict:
+def _install_fake_mlflow(
+    monkeypatch,
+    *,
+    fail: bool = False,
+    run_id: str = "run-abc123",
+    registered_version: str | None = "3",
+    search_result: str | None = None,
+    alias_fail: bool = False,
+) -> dict:
     """Sustituye mlflow en sys.modules por un doble que registra las llamadas."""
     calls: dict = {}
     fake = types.ModuleType("mlflow")
@@ -140,24 +160,38 @@ def _install_fake_mlflow(monkeypatch, *, fail: bool = False, run_id: str = "run-
         calls["run_name"] = run_name
         yield _FakeRun(run_id)
 
+    def log_model(*args, **kwargs):
+        calls["log_model"] = kwargs
+        return types.SimpleNamespace(registered_model_version=registered_version)
+
+    class FakeClient:
+        def search_model_versions(self, filter_string):
+            calls["search"] = filter_string
+            if search_result is None:
+                return []
+            return [types.SimpleNamespace(version=search_result)]
+
+        def set_registered_model_alias(self, name, alias, version):
+            if alias_fail:
+                raise RuntimeError("registry caido")
+            calls["alias"] = (name, alias, version)
+
     fake.set_tracking_uri = set_tracking_uri
     fake.set_experiment = lambda name: calls.__setitem__("experiment", name)
     fake.start_run = start_run
     fake.log_params = lambda params: calls.__setitem__("params", params)
     fake.log_metrics = lambda metrics: calls.__setitem__("metrics", metrics)
-    fake_sklearn.log_model = lambda *args, **kwargs: calls.__setitem__("log_model", kwargs)
+    fake.MlflowClient = FakeClient
+    fake_sklearn.log_model = log_model
     fake.sklearn = fake_sklearn
     monkeypatch.setitem(sys.modules, "mlflow", fake)
     monkeypatch.setitem(sys.modules, "mlflow.sklearn", fake_sklearn)
     return calls
 
 
-def _settings_con_mlflow(monkeypatch) -> None:
-    monkeypatch.setattr(
-        train_module,
-        "get_settings",
-        lambda: Settings(_env_file=None, mlflow_tracking_uri="http://mlflow.test:5000"),
-    )
+def _settings_con_mlflow(monkeypatch, **overrides) -> None:
+    settings = Settings(_env_file=None, mlflow_tracking_uri="http://mlflow.test:5000", **overrides)
+    monkeypatch.setattr(train_module, "get_settings", lambda: settings)
 
 
 def test_mlflow_desactivado_sin_tracking_uri(tmp_path, monkeypatch, train_small):
@@ -184,21 +218,65 @@ def test_mlflow_caido_no_tumba_el_entrenamiento(tmp_path, monkeypatch, train_sma
     assert "mlflow caido" in caplog.text
 
 
-def test_mlflow_ok_registra_run_y_lo_persiste(tmp_path, monkeypatch, train_small):
+def test_mlflow_ok_registra_run_alias_y_lo_persiste(tmp_path, monkeypatch, train_small):
     _settings_con_mlflow(monkeypatch)
-    calls = _install_fake_mlflow(monkeypatch, run_id="run-xyz")
+    calls = _install_fake_mlflow(monkeypatch, run_id="run-xyz", registered_version="3")
     metadata = train_small(tmp_path, seed=31)
 
     assert metadata["mlflow_run_id"] == "run-xyz"
+    assert metadata["mlflow_model_version"] == "3"
     persisted = json.loads((tmp_path / "metadata.json").read_text())
     assert persisted["mlflow_run_id"] == "run-xyz"
+    assert persisted["mlflow_model_version"] == "3"
     assert calls["uri"] == "http://mlflow.test:5000"
     assert calls["experiment"] == "churn"
     assert calls["run_name"] == f"train-{metadata['model_version']}"
     assert calls["params"]["seed"] == 31 and calls["params"]["min_roc_auc"] == 0.75
+    assert calls["params"]["scikit_learn"] == sklearn.__version__
     assert calls["metrics"]["roc_auc"] == metadata["metrics"]["roc_auc"]
     assert calls["log_model"]["registered_model_name"] == "churn-classifier"
     assert len(calls["log_model"]["input_example"]) == 5
+    assert calls["alias"] == ("churn-classifier", "champion", "3")
+    assert "search" not in calls  # log_model ya devolvio la version registrada
+
+
+def test_mlflow_busca_la_version_si_log_model_no_la_devuelve(tmp_path, monkeypatch, train_small):
+    _settings_con_mlflow(monkeypatch)
+    calls = _install_fake_mlflow(
+        monkeypatch, run_id="run-old", registered_version=None, search_result="7"
+    )
+    metadata = train_small(tmp_path, seed=32)
+    assert "run_id='run-old'" in calls["search"]
+    assert calls["alias"] == ("churn-classifier", "champion", "7")
+    assert metadata["mlflow_model_version"] == "7"
+
+
+def test_mlflow_sin_version_registrada_no_asigna_alias(tmp_path, monkeypatch, train_small, caplog):
+    _settings_con_mlflow(monkeypatch)
+    calls = _install_fake_mlflow(monkeypatch, registered_version=None, search_result=None)
+    metadata = train_small(tmp_path, seed=33)
+    assert "alias" not in calls
+    assert metadata["mlflow_run_id"] == "run-abc123"
+    assert metadata["mlflow_model_version"] is None
+    assert "No se encontro la version registrada" in caplog.text
+
+
+def test_mlflow_alias_fallido_conserva_el_run_id(tmp_path, monkeypatch, train_small, caplog):
+    _settings_con_mlflow(monkeypatch)
+    _install_fake_mlflow(monkeypatch, alias_fail=True)
+    metadata = train_small(tmp_path, seed=34)
+    assert metadata["mlflow_run_id"] == "run-abc123"
+    assert metadata["mlflow_model_version"] is None
+    assert "No se pudo asignar el alias" in caplog.text
+
+
+def test_mlflow_alias_desactivado_por_configuracion(tmp_path, monkeypatch, train_small):
+    _settings_con_mlflow(monkeypatch, mlflow_champion_alias="")
+    calls = _install_fake_mlflow(monkeypatch)
+    metadata = train_small(tmp_path, seed=35)
+    assert "alias" not in calls
+    assert metadata["mlflow_run_id"] == "run-abc123"
+    assert metadata["mlflow_model_version"] is None
 
 
 # ------------------------------------------------------------------ CLI

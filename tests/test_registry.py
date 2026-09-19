@@ -1,9 +1,20 @@
 import json
+import platform
 
 import pandas as pd
 import pytest
+import sklearn
 
-from churn.registry import ARTIFACT_FILES, LoadedModel, LocalModelStore, ModelArtifactError
+from churn.data.generator import CATEGORICAL_FEATURES, NUMERIC_FEATURES
+from churn.registry import (
+    ARTIFACT_FILES,
+    LoadedModel,
+    LocalModelStore,
+    ModelArtifactError,
+    ModelCompatibilityError,
+    verify_compatibility,
+)
+from churn.training.train import runtime_versions
 
 
 class FakePipeline:
@@ -107,6 +118,74 @@ def test_reference_ilegible(store):
     store.reference_path.write_text("", encoding="utf-8")
     with pytest.raises(ModelArtifactError, match="reference.csv ilegible"):
         store.load()
+
+
+# ------------------------------------------------------------------ compatibilidad
+
+
+def _compatible_metadata(**overrides) -> dict:
+    metadata = {
+        "model_version": "v1",
+        "numeric_features": list(NUMERIC_FEATURES),
+        "categorical_features": list(CATEGORICAL_FEATURES),
+        "runtime": runtime_versions(),
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+def _bump_minor(version: str) -> str:
+    major, minor, *rest = version.split(".")
+    return ".".join([major, str(int(minor) + 1), *rest])
+
+
+def test_compatibilidad_modelo_actual_sin_avisos():
+    assert verify_compatibility(_compatible_metadata()) == []
+
+
+def test_compatibilidad_rechaza_features_distintas():
+    metadata = _compatible_metadata(numeric_features=list(NUMERIC_FEATURES[:-1]))
+    with pytest.raises(ModelCompatibilityError, match="features del modelo"):
+        verify_compatibility(metadata)
+    extra = _compatible_metadata(categorical_features=[*CATEGORICAL_FEATURES, "region"])
+    with pytest.raises(ModelCompatibilityError, match="features del modelo"):
+        verify_compatibility(extra, strict_runtime=False)
+
+
+def test_compatibilidad_el_orden_de_las_features_no_importa():
+    metadata = _compatible_metadata(
+        numeric_features=list(reversed(NUMERIC_FEATURES)),
+        categorical_features=list(reversed(CATEGORICAL_FEATURES)),
+    )
+    assert verify_compatibility(metadata) == []
+
+
+def test_compatibilidad_metadata_antiguo_sin_runtime_solo_avisa():
+    metadata = _compatible_metadata()
+    del metadata["runtime"]
+    warnings = verify_compatibility(metadata)
+    assert len(warnings) == 1 and "sin versiones de runtime" in warnings[0]
+
+
+def test_compatibilidad_sklearn_otra_version_menor():
+    runtime = {**runtime_versions(), "scikit_learn": _bump_minor(sklearn.__version__)}
+    metadata = _compatible_metadata(runtime=runtime)
+    with pytest.raises(ModelCompatibilityError, match="CHURN_STRICT_ARTIFACT_COMPAT"):
+        verify_compatibility(metadata, strict_runtime=True)
+    warnings = verify_compatibility(metadata, strict_runtime=False)
+    assert any("no son portables" in w for w in warnings)
+
+
+def test_compatibilidad_sklearn_otro_parche_solo_avisa():
+    runtime = {**runtime_versions(), "scikit_learn": sklearn.__version__ + ".post1"}
+    warnings = verify_compatibility(_compatible_metadata(runtime=runtime))
+    assert len(warnings) == 1 and "distinto parche" in warnings[0]
+
+
+def test_compatibilidad_python_distinto_solo_avisa():
+    runtime = {**runtime_versions(), "python": _bump_minor(platform.python_version())}
+    warnings = verify_compatibility(_compatible_metadata(runtime=runtime))
+    assert len(warnings) == 1 and "Python del modelo" in warnings[0]
 
 
 def test_save_metadata_actualiza_solo_metadata(store):

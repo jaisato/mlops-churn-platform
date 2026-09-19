@@ -4,7 +4,8 @@ Uso:
     python -m churn.training.train --rows 20000 --model-dir models [--min-auc 0.8]
 Variables:
     CHURN_MLFLOW_TRACKING_URI  si esta definida, se registran parametros,
-    metricas, artefactos y version del modelo en MLflow Model Registry.
+    metricas, artefactos y version del modelo en MLflow Model Registry, y la
+    version registrada recibe el alias CHURN_MLFLOW_CHAMPION_ALIAS.
     CHURN_MIN_ROC_AUC          gate de calidad: por debajo de este AUC el
     entrenamiento falla y NO sobreescribe los artefactos del modelo en servicio.
 """
@@ -13,10 +14,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime, timezone
+import platform
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, roc_auc_score
@@ -25,7 +30,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 from churn import __version__
-from churn.config import get_settings
+from churn.config import Settings, get_settings
 from churn.data.generator import (
     CATEGORICAL_FEATURES,
     FEATURE_COLUMNS,
@@ -62,8 +67,18 @@ def build_pipeline(seed: int = 42) -> Pipeline:
 
 def new_model_version(now: datetime | None = None) -> str:
     """Version legible por timestamp + sufijo aleatorio (evita colisiones en el mismo segundo)."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     return f"{now.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:6]}"
+
+
+def runtime_versions() -> dict[str, str]:
+    """Versiones con las que se serializo el pipeline: la API las compara antes de servir."""
+    return {
+        "python": platform.python_version(),
+        "scikit_learn": sklearn.__version__,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+    }
 
 
 def train(
@@ -110,7 +125,7 @@ def train(
             "se conservan los artefactos anteriores"
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     metadata = {
         "model_version": new_model_version(now),
         "code_version": __version__,
@@ -121,7 +136,9 @@ def train(
         "quality_gate": quality_gate,
         "numeric_features": NUMERIC_FEATURES,
         "categorical_features": CATEGORICAL_FEATURES,
+        "runtime": runtime_versions(),
         "mlflow_run_id": None,
+        "mlflow_model_version": None,
     }
 
     store = LocalModelStore(model_dir)
@@ -129,15 +146,17 @@ def train(
     store.save(pipeline, metadata, reference)
     logger.info("Modelo guardado en %s | metricas: %s", model_dir, metrics)
 
-    run_id = _maybe_log_to_mlflow(pipeline, metadata, x_test.head(5))
-    if run_id:
-        metadata["mlflow_run_id"] = run_id
+    tracking = _maybe_log_to_mlflow(pipeline, metadata, x_test.head(5))
+    if tracking:
+        metadata.update(tracking)
         store.save_metadata(metadata)
     return metadata
 
 
-def _maybe_log_to_mlflow(pipeline, metadata: dict, input_example: pd.DataFrame) -> str | None:
-    """Registro opcional en MLflow. Devuelve el run_id o None.
+def _maybe_log_to_mlflow(
+    pipeline, metadata: dict, input_example: pd.DataFrame
+) -> dict[str, str | None] | None:
+    """Registro opcional en MLflow. Devuelve `{mlflow_run_id, mlflow_model_version}` o None.
 
     El tracking es un plus de trazabilidad, no un punto unico de fallo: si MLflow no
     esta instalado o no responde, se registra el aviso y el entrenamiento (cuyos
@@ -164,12 +183,13 @@ def _maybe_log_to_mlflow(pipeline, metadata: dict, input_example: pd.DataFrame) 
                     "model_version": metadata["model_version"],
                     "seed": metadata["seed"],
                     "min_roc_auc": metadata["quality_gate"]["min_roc_auc"],
+                    "scikit_learn": metadata["runtime"]["scikit_learn"],
                 }
             )
             mlflow.log_metrics(
                 {k: v for k, v in metadata["metrics"].items() if isinstance(v, (int, float))}
             )
-            mlflow.sklearn.log_model(
+            model_info = mlflow.sklearn.log_model(
                 pipeline,
                 artifact_path="model",
                 registered_model_name=settings.mlflow_registered_model,
@@ -183,7 +203,38 @@ def _maybe_log_to_mlflow(pipeline, metadata: dict, input_example: pd.DataFrame) 
         )
         return None
     logger.info("Run %s registrado en MLflow (%s)", run_id, settings.mlflow_tracking_uri)
-    return run_id
+    registry_version = _promote_champion(mlflow, settings, run_id, model_info)
+    return {"mlflow_run_id": run_id, "mlflow_model_version": registry_version}
+
+
+def _promote_champion(
+    mlflow_module: Any, settings: Settings, run_id: str, model_info: Any
+) -> str | None:
+    """Asigna el alias de campeon a la version registrada del run. Devuelve la version o None.
+
+    Solo llegan aqui modelos que han superado el gate, asi que el alias siempre apunta al
+    ultimo modelo publicable: el registry deja de ser un log de escritura y pasa a ser la
+    fuente de "que modelo esta en produccion".
+    """
+    alias = settings.mlflow_champion_alias
+    if not alias:
+        return None
+    name = settings.mlflow_registered_model
+    try:
+        client = mlflow_module.MlflowClient()
+        version = getattr(model_info, "registered_model_version", None)
+        if version is None:
+            found = client.search_model_versions(f"name='{name}' and run_id='{run_id}'")
+            version = found[0].version if found else None
+        if version is None:
+            logger.warning("No se encontro la version registrada del run %s; sin alias", run_id)
+            return None
+        client.set_registered_model_alias(name, alias, str(version))
+    except Exception:
+        logger.exception("No se pudo asignar el alias %s en el registry %s", alias, name)
+        return None
+    logger.info("Alias %s -> %s v%s", alias, name, version)
+    return str(version)
 
 
 def main(argv: list[str] | None = None) -> int:

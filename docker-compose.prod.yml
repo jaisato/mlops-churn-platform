@@ -32,7 +32,7 @@ services:
         condition: service_healthy
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.16.2
+    image: ghcr.io/mlflow/mlflow:v2.22.0  # misma familia que el cliente (requirements.txt)
     # La UI se sirve tras Caddy en /mlflow/ (strip_prefix). NO anadir --static-prefix:
     # moveria las rutas ajax-api bajo /mlflow y Caddy las dejaria sin prefijo (404).
     command: >

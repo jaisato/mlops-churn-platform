@@ -23,13 +23,14 @@ from churn import __version__
 from churn.config import Settings, get_settings
 from churn.logging_conf import configure_logging
 from churn.monitoring.drift import drift_report
-from churn.registry import LoadedModel, LocalModelStore
+from churn.registry import LoadedModel, LocalModelStore, verify_compatibility
 from churn.serving.schemas import (
     BatchPredictionRequest,
     BatchPredictionResponse,
     CustomerFeatures,
     DriftResponse,
     HealthResponse,
+    LivenessResponse,
     ModelInfoResponse,
     PredictionResponse,
     ReloadResponse,
@@ -72,9 +73,14 @@ def risk_level(probability: float, medium: float, high: float) -> str:
 
 
 def _load_model(app: FastAPI) -> ServedModel:
-    """Carga los artefactos y precalcula las puntuaciones de la referencia."""
+    """Carga los artefactos, comprueba su compatibilidad y precalcula las puntuaciones."""
     store: LocalModelStore = app.state.store
+    settings: Settings = app.state.settings
     loaded = store.load()
+    for warning in verify_compatibility(
+        loaded.metadata, strict_runtime=settings.strict_artifact_compat
+    ):
+        logger.warning("Compatibilidad del modelo %s: %s", loaded.version, warning)
     scores = loaded.pipeline.predict_proba(loaded.reference[loaded.feature_columns])[:, 1]
     served = ServedModel(loaded=loaded, reference_scores=np.asarray(scores, dtype=float))
     app.state.model = served  # asignacion atomica: las peticiones en vuelo ven el viejo o el nuevo
@@ -88,9 +94,9 @@ def _try_load_on_startup(app: FastAPI) -> None:
     except FileNotFoundError:
         app.state.model = None
         logger.warning("No hay modelo completo en %s; la API respondera 503", store.model_dir)
-    except Exception:  # artefactos corruptos: arrancamos sin modelo para permitir /model/reload
+    except Exception:  # corruptos o incompatibles: arrancamos sin modelo y se podra hacer reload
         app.state.model = None
-        logger.exception("Artefactos ilegibles en %s; la API respondera 503", store.model_dir)
+        logger.exception("No se pudo cargar el modelo de %s; respondera 503", store.model_dir)
     else:
         logger.info("Modelo cargado: %s", served.version)
 
@@ -138,8 +144,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return predictions
 
+    @app.get("/health/live", response_model=LivenessResponse, tags=["sistema"])
+    def health_live():
+        """Liveness: el proceso responde. No depende de que haya modelo cargado."""
+        return LivenessResponse(status="alive", code_version=__version__)
+
     @app.get("/health", response_model=HealthResponse, tags=["sistema"])
     def health(request: Request):
+        """Readiness: 200 solo si hay un modelo cargado y listo para puntuar."""
         model = request.app.state.model
         if model is None:
             raise HTTPException(status_code=503, detail="Modelo no cargado")
