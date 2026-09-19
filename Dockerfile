@@ -2,8 +2,9 @@
 FROM python:3.12-slim AS builder
 WORKDIR /build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
-COPY requirements.txt .
-RUN python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt
+# requirements.lock fija versiones exactas (generado con `make lock`): builds reproducibles
+COPY requirements.lock .
+RUN python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.lock
 
 FROM python:3.12-slim
 ENV PATH="/opt/venv/bin:$PATH" \

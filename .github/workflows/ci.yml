@@ -16,8 +16,8 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Instalar dependencias
-        run: pip install -r requirements-dev.txt
+      - name: Instalar dependencias (lockfile)
+        run: pip install -r requirements-dev.lock
 
       - name: Lint (ruff)
         run: ruff check .

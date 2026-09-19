@@ -2,7 +2,7 @@
 name = "mlops-churn-platform"
 version = "1.1.0"
 description = "Plataforma MLOps end-to-end para prediccion de churn (MLflow + FastAPI + drift)"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -20,7 +20,7 @@ exclude_also = ["if __name__ == .__main__.:"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]

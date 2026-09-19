@@ -1,7 +1,11 @@
-.PHONY: install lint test coverage train run up down logs retrain drift
+.PHONY: install lock lint test coverage train run up down logs retrain drift
 
-install:            ## Dependencias de desarrollo
-	pip install -r requirements-dev.txt
+install:            ## Dependencias de desarrollo (versiones fijadas en el lockfile)
+	pip install -r requirements-dev.lock
+
+lock:               ## Regenera los lockfiles a partir de requirements*.txt (necesita uv)
+	uv pip compile requirements.txt -o requirements.lock --universal --python-version 3.11
+	uv pip compile requirements-dev.txt -o requirements-dev.lock --universal --python-version 3.11
 
 lint:
 	ruff check .
