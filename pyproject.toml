@@ -1,6 +1,6 @@
 [project]
 name = "mlops-churn-platform"
-version = "1.1.0"
+version = "1.2.0"
 description = "Plataforma MLOps end-to-end para prediccion de churn (MLflow + FastAPI + drift)"
 requires-python = ">=3.11"
 
