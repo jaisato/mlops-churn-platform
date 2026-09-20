@@ -20,7 +20,7 @@ train:              ## Entrena en local (sin Docker) y deja artefactos en ./mode
 	PYTHONPATH=src python -m churn.training.train --rows 20000 --model-dir models
 
 run: train          ## API local sin Docker
-	CHURN_MODEL_DIR=models PYTHONPATH=src uvicorn churn.serving.main:app --reload --port 8010
+	CHURN_MODEL_DIR=models PYTHONPATH=src uvicorn churn.serving.main:app --reload --port 8010 --no-access-log
 
 up:                 ## Stack completo local (MLflow + trainer + API)
 	docker compose up --build -d

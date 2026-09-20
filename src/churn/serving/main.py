@@ -7,26 +7,32 @@ la distribucion de puntuaciones del modelo (prediction drift).
 
 Operaciones de modelo (autenticadas con X-Admin-Token): /model/reload carga la
 version en servicio del almacen, /model/rollback vuelve a una version anterior.
+
+Observabilidad: cada peticion lleva X-Request-ID (propagado o generado), se registra
+como una linea JSON y alimenta las metricas Prometheus de /metrics.
 """
 
 from __future__ import annotations
 
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 
 from churn import __version__
 from churn.config import Settings, get_settings
-from churn.logging_conf import configure_logging
+from churn.logging_conf import configure_logging, request_id_var
 from churn.monitoring.drift import drift_report
 from churn.monitoring.store import PredictionStore, build_prediction_store
 from churn.registry import LoadedModel, LocalModelStore, verify_compatibility
+from churn.serving.metrics import CONTENT_TYPE_LATEST, Metrics
 from churn.serving.schemas import (
     BatchPredictionRequest,
     BatchPredictionResponse,
@@ -43,6 +49,7 @@ from churn.serving.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+access_logger = logging.getLogger("churn.access")
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,7 @@ def _load_model(app: FastAPI, version: str | None = None) -> ServedModel:
     scores = loaded.pipeline.predict_proba(loaded.reference[loaded.feature_columns])[:, 1]
     served = ServedModel(loaded=loaded, reference_scores=np.asarray(scores, dtype=float))
     app.state.model = served  # asignacion atomica: las peticiones en vuelo ven el viejo o el nuevo
+    app.state.metrics.set_model(served.version)
     return served
 
 
@@ -110,10 +118,12 @@ def _try_load_on_startup(app: FastAPI) -> None:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
+    metrics = Metrics()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.settings = settings
+        app.state.metrics = metrics
         app.state.store = LocalModelStore(
             settings.model_dir, keep_versions=settings.model_keep_versions
         )
@@ -128,6 +138,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # ------------------------------------------------------------------ observabilidad
+
+    def _record_request(request: Request, status: int, started: float, request_id: str) -> None:
+        duration = time.perf_counter() - started
+        route = request.scope.get("route")
+        template = getattr(route, "path", "unmatched")  # plantilla, no la URL: cardinalidad acotada
+        metrics.observe_request(request.method, template, status, duration)
+        if settings.access_log and request.url.path != "/metrics":
+            access_logger.info(
+                "%s %s -> %s",
+                request.method,
+                request.url.path,
+                status,
+                extra={
+                    "request_id": request_id,
+                    "http": {
+                        "method": request.method,
+                        "path": request.url.path,
+                        "route": template,
+                        "status": status,
+                        "duration_ms": round(duration * 1000, 2),
+                    },
+                },
+            )
+
+    @app.middleware("http")
+    async def observability(request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or uuid4().hex[:16]
+        token = request_id_var.set(request_id)
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            _record_request(request, 500, started, request_id)
+            raise
+        else:
+            response.headers["X-Request-ID"] = request_id
+            _record_request(request, response.status_code, started, request_id)
+            return response
+        finally:
+            request_id_var.reset(token)
+
+    # ------------------------------------------------------------------ helpers
+
     def _model(request: Request) -> ServedModel:
         model = request.app.state.model
         if model is None:
@@ -138,6 +192,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # compare_digest: comparacion en tiempo constante (no filtra el token por timing)
         if not secrets.compare_digest(token.encode(), settings.admin_token.encode()):
             raise HTTPException(status_code=401, detail="Token de administracion invalido")
+
+    def require_api_key(x_api_key: str = Header(default="")) -> None:
+        """Protege scoring, informacion del modelo y drift cuando CHURN_API_KEY esta definida."""
+        if not settings.api_key:
+            return
+        if not secrets.compare_digest(x_api_key.encode(), settings.api_key.encode()):
+            raise HTTPException(
+                status_code=401, detail="API key invalida o ausente (cabecera X-API-Key)"
+            )
+
+    protected = [Depends(require_api_key)]
 
     def _risk(p: float) -> str:
         return risk_level(p, settings.risk_medium, settings.risk_high)
@@ -150,12 +215,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {**row, "churn_probability": p, "model_version": model.version}
             for row, p in zip(rows, probas, strict=True)
         )
-        return [
-            PredictionResponse(
-                churn_probability=round(p, 4), risk_level=_risk(p), model_version=model.version
+        predictions = []
+        for p in probas:
+            risk = _risk(p)
+            metrics.observe_prediction(risk, model.version, p)
+            predictions.append(
+                PredictionResponse(
+                    churn_probability=round(p, 4), risk_level=risk, model_version=model.version
+                )
             )
-            for p in probas
-        ]
+        return predictions
 
     # ------------------------------------------------------------------ sistema
 
@@ -172,13 +241,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="Modelo no cargado")
         return HealthResponse(status="ok", model_loaded=True, model_version=model.version)
 
+    if settings.metrics_enabled:
+
+        @app.get("/metrics", tags=["sistema"], include_in_schema=False)
+        def prometheus_metrics():
+            return Response(content=metrics.render(), media_type=CONTENT_TYPE_LATEST)
+
     # ------------------------------------------------------------------ modelo
 
-    @app.get("/model/info", response_model=ModelInfoResponse, tags=["modelo"])
+    @app.get(
+        "/model/info", response_model=ModelInfoResponse, tags=["modelo"], dependencies=protected
+    )
     def model_info(request: Request):
         return ModelInfoResponse(**_model(request).metadata)
 
-    @app.get("/model/versions", response_model=ModelVersionsResponse, tags=["modelo"])
+    @app.get(
+        "/model/versions",
+        response_model=ModelVersionsResponse,
+        tags=["modelo"],
+        dependencies=protected,
+    )
     def model_versions(request: Request):
         store: LocalModelStore = request.app.state.store
         served = request.app.state.model
@@ -247,17 +329,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ scoring
 
-    @app.post("/predict", response_model=PredictionResponse, tags=["scoring"])
+    @app.post(
+        "/predict", response_model=PredictionResponse, tags=["scoring"], dependencies=protected
+    )
     def predict(request: Request, features: CustomerFeatures):
         return _score(_model(request), [features])[0]
 
-    @app.post("/predict/batch", response_model=BatchPredictionResponse, tags=["scoring"])
+    @app.post(
+        "/predict/batch",
+        response_model=BatchPredictionResponse,
+        tags=["scoring"],
+        dependencies=protected,
+    )
     def predict_batch(request: Request, body: BatchPredictionRequest):
         return BatchPredictionResponse(predictions=_score(_model(request), body.customers))
 
     # ------------------------------------------------------------------ monitorizacion
 
-    @app.get("/monitoring/drift", response_model=DriftResponse, tags=["monitorizacion"])
+    @app.get(
+        "/monitoring/drift",
+        response_model=DriftResponse,
+        tags=["monitorizacion"],
+        dependencies=protected,
+    )
     def monitoring_drift(request: Request):
         model = _model(request)
         store: PredictionStore = request.app.state.predictions
@@ -283,6 +377,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reference_scores=model.reference_scores if enough_scores else None,
             current_scores=scores if enough_scores else None,
         )
+        metrics.observe_drift(report)
         return DriftResponse(model_version=model.version, **report)
 
     return app

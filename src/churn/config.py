@@ -53,8 +53,15 @@ class Settings(BaseSettings):
     drift_store: Literal["sqlite", "memory"] = "sqlite"
     drift_db_path: str = ""
 
-    # Token para operaciones administrativas (p. ej. /model/reload)
+    # Token para operaciones administrativas (/model/reload, /model/rollback)
     admin_token: str = "cambia-este-token"
+    # API key opcional para scoring, informacion del modelo y drift (cabecera X-API-Key).
+    # Vacia = endpoints abiertos (la red privada/VPN hace de perimetro).
+    api_key: str = ""
+
+    # Observabilidad
+    metrics_enabled: bool = True  # expone /metrics en formato Prometheus
+    access_log: bool = True  # una linea JSON por peticion (excepto /metrics)
 
     @property
     def is_production(self) -> bool:

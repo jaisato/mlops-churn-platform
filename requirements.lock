@@ -145,6 +145,8 @@ pandas==2.3.3
     #   mlflow
 pillow==12.3.0
     # via matplotlib
+prometheus-client==0.26.0
+    # via -r requirements.txt
 protobuf==6.33.6
     # via
     #   databricks-sdk
