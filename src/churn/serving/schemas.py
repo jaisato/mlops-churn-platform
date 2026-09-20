@@ -12,7 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from churn.data.validation import RANGES
 
-EXAMPLE_CUSTOMER = {
+RiskLevel = Literal["bajo", "medio", "alto"]
+
+EXAMPLE_CUSTOMER: dict[str, Any] = {
     "tenure_months": 3,
     "monthly_charges": 95.5,
     "total_charges": 280.0,
@@ -46,7 +48,7 @@ class PredictionResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     churn_probability: float = Field(..., ge=0.0, le=1.0)
-    risk_level: Literal["bajo", "medio", "alto"]
+    risk_level: RiskLevel
     model_version: str
 
 

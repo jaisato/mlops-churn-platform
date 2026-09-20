@@ -41,9 +41,11 @@ from churn.serving.schemas import (
     HealthResponse,
     LivenessResponse,
     ModelInfoResponse,
+    ModelVersionInfo,
     ModelVersionsResponse,
     PredictionResponse,
     ReloadResponse,
+    RiskLevel,
     RollbackRequest,
     RollbackResponse,
 )
@@ -76,7 +78,7 @@ class ServedModel:
         return self.loaded.version
 
 
-def risk_level(probability: float, medium: float, high: float) -> str:
+def risk_level(probability: float, medium: float, high: float) -> RiskLevel:
     """Nivel de riesgo de negocio: alto si p >= high, medio si p >= medium, bajo en otro caso."""
     if probability >= high:
         return "alto"
@@ -204,7 +206,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     protected = [Depends(require_api_key)]
 
-    def _risk(p: float) -> str:
+    def _risk(p: float) -> RiskLevel:
         return risk_level(p, settings.risk_medium, settings.risk_high)
 
     def _score(model: ServedModel, customers: list[CustomerFeatures]) -> list[PredictionResponse]:
@@ -267,7 +269,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return ModelVersionsResponse(
             current=store.current_version() or (served.version if served else None),
             serving=served.version if served else None,
-            versions=store.describe_versions(),
+            versions=[ModelVersionInfo(**entry) for entry in store.describe_versions()],
         )
 
     @app.post("/model/reload", response_model=ReloadResponse, tags=["modelo"])
