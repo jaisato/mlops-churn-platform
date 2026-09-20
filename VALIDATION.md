@@ -1,5 +1,33 @@
 # Validación de correcciones
 
+## Ronda 3 (19/20-09-2026): verificación real, mejoras de prioridad alta, almacén versionado, observabilidad
+
+Resultado: `make check` limpio (ruff + formato, mypy, **227 tests en 13 módulos, 100 % de
+cobertura de líneas y ramas**); `shellcheck`, `actionlint` y `hadolint` sin hallazgos; CI en
+GitHub en verde en la matriz 3.11/3.12/3.13. Repositorio: https://github.com/jaisato/mlops-churn-platform.
+
+Verificado con el stack levantado (no solo tests):
+
+| Escenario | Cómo | Resultado |
+|---|---|---|
+| Stack local completo | `docker compose up --build`: MLflow con healthcheck → trainer → API | `/health` 200 en el primer intento; run en MLflow y alias `champion` → v1; `/predict`, drift 409 → 251 predicciones → 200 con PSI de predicciones; `/metrics`; `X-Request-ID`; log de acceso JSON |
+| Reentreno, reload y rollback | `docker compose run trainer` + `POST /model/reload` + `POST /model/rollback` | Segunda versión publicada (alias `champion` → v2), reload a la nueva, rollback a la anterior; el volumen muestra `current`, `versions/<v>/` y `drift.sqlite` |
+| Stack de producción en local | Registro Docker local (`IMAGE_REGISTRY=localhost:5001`), `.env` con `TAG=latest` y `TAG=1.0.0 ./deploy/scripts/deploy.sh` | Volumen vacío → 503 → entrenamiento inicial → reload → 200 en 15 s; `.current_tag=1.0.0` (el `TAG` pedido prevalece sobre el de `.env`) |
+| Caddy con TLS interno | `curl -k https://127.0.0.1:8443/...` | **Bug heredado**: con el sitio `:443` los clientes por IP (sin SNI) recibían `tlsv1 alert internal error`. Corregido con el sitio en la IP de la VPN y `default_sni`. Tras la corrección: API 200 vía proxy, certificado con SAN de la IP, `/mlflow` → 301 → `/mlflow/`, UI de MLflow (index, assets JS, `ajax-api`) 200 tras `strip_prefix`, HTTP → HTTPS 301 |
+| Rollback automático de imagen | Imagen rota etiquetada `1.0.1` + `TAG=1.0.1 ./deploy/scripts/deploy.sh` | La API entra en bucle de reinicio, `deploy.sh` agota la espera, vuelve a `1.0.0` y termina con código 1; `/health` 200 con la imagen anterior |
+| Backup de volúmenes | `deploy/scripts/backup.sh` | **Bug propio**: no leía `.env` y buscaba los volúmenes con el nombre de proyecto equivocado. Corregido: dos `.tgz` (models, mlflow-data) con retención |
+| Reentrenamiento por drift | `deploy/scripts/retrain-if-drift.sh` sin datos, con `FORCE=1` y con `CHURN_MIN_ROC_AUC=0.999` | **Bug propio**: `FORCE=1` se ignoraba si no había datos de drift. Corregido: 409 → salida 0; forzado → nueva versión recargada y alias `champion` actualizado; gate rechazado → salida 2 y modelo en servicio intacto. Requirió pasar `CHURN_MIN_ROC_AUC` al trainer en el compose de producción |
+| Healthcheck de MLflow | `docker run` de la imagen oficial 2.22 con el comando del compose | `healthy` |
+
+Mejoras de esta ronda (detalle en `CHANGELOG.md`): almacén de modelos versionado con
+rollback y retención, predicciones en SQLite, compatibilidad de artefactos (runtime y
+features), alias `champion` en MLflow, `/health/live`, `/metrics`, `X-Request-ID` y logs
+JSON unificados, API key opcional, lockfiles con uv, Python 3.11+, scripts de backup y
+reentreno, endurecimiento del VPS, huella SSH fijada, CI ampliado y tests de propiedades.
+
+Pendiente de verificar en el VPS real: el túnel WireGuard, el workflow `deploy.yml` con
+los secretos, y `https://10.8.0.1/mlflow/` desde un navegador dentro de la VPN.
+
 ## Ronda 2 (14-09-2026): bugs, robustez operativa y cobertura
 
 Resultado: `ruff check .` limpio; `pytest --cov=churn` → **148 tests, 100 % de cobertura
