@@ -10,6 +10,7 @@
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+if [ -f .env ]; then set -a; . ./.env; set +a; fi   # COMPOSE_PROJECT_NAME, si esta definido
 
 BACKUP_DIR="${BACKUP_DIR:-/backup/mlops-churn-platform}"
 KEEP_DAYS="${KEEP_DAYS:-14}"

@@ -1,9 +1,15 @@
 # TLS interno para la red privada VPN. La API y MLflow quedan tras el proxy.
+#
+# El sitio se declara con la IP de la VPN (VPN_BIND_IP, inyectada por compose) y no como
+# ":443": con un sitio sin nombre Caddy no sabe para que emitir el certificado interno y
+# los clientes que entran por IP (sin SNI) reciben un fallo TLS. default_sni cubre
+# precisamente a esos clientes (curl https://10.8.0.1, el navegador por IP...).
 {
     auto_https disable_redirects
+    default_sni {$VPN_BIND_IP}
 }
 
-:443 {
+{$VPN_BIND_IP}:443 {
     tls internal
     encode gzip
 
