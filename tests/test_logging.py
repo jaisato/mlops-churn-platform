@@ -8,7 +8,12 @@ from churn.logging_conf import UVICORN_LOGGERS, JsonFormatter, configure_logging
 
 def _record(msg="hola %s", args=("mundo",), level=logging.INFO, exc_info=None):
     record = logging.LogRecord(
-        name="churn.test", level=level, pathname=__file__, lineno=1, msg=msg, args=args,
+        name="churn.test",
+        level=level,
+        pathname=__file__,
+        lineno=1,
+        msg=msg,
+        args=args,
         exc_info=exc_info,
     )
     record.created = 1_700_000_000.5  # 2023-11-14T22:13:20.5Z

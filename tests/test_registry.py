@@ -282,7 +282,11 @@ def test_describe_versions(store):
     described = store.describe_versions()
     assert [d["version"] for d in described] == ["v1", "v2"]
     assert described[1] == {
-        "version": "v2", "current": True, "complete": True, "trained_at": "t-v2", "roc_auc": None,
+        "version": "v2",
+        "current": True,
+        "complete": True,
+        "trained_at": "t-v2",
+        "roc_auc": None,
     }
     assert described[0]["current"] is False and described[0]["trained_at"] is None
 

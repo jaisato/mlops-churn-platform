@@ -38,7 +38,11 @@ def test_append_y_recent_en_orden_cronologico(store):
     assert store.count() == 5
     assert list(df["tenure_months"]) == [0, 1, 2, 3, 4]
     assert set(df.columns) == {
-        "tenure_months", "monthly_charges", "contract_type", "churn_probability", "model_version",
+        "tenure_months",
+        "monthly_charges",
+        "contract_type",
+        "churn_probability",
+        "model_version",
     }
 
 

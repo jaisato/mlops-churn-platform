@@ -51,9 +51,13 @@ def test_prediction_response_acota_la_probabilidad():
 def test_model_info_tolera_metadata_antiguo_sin_campos_nuevos():
     """Modelos entrenados antes del gate/MLflow siguen siendo servibles."""
     info = ModelInfoResponse(
-        model_version="v0", algorithm="X", trained_at="2026-01-01T00:00:00+00:00",
-        metrics={"roc_auc": 0.9, "n_train": 100}, numeric_features=["a"],
-        categorical_features=[], extra_desconocido="ignorado",
+        model_version="v0",
+        algorithm="X",
+        trained_at="2026-01-01T00:00:00+00:00",
+        metrics={"roc_auc": 0.9, "n_train": 100},
+        numeric_features=["a"],
+        categorical_features=[],
+        extra_desconocido="ignorado",
     )
     assert info.quality_gate is None and info.mlflow_run_id is None
     assert info.metrics["n_train"] == 100
@@ -62,7 +66,11 @@ def test_model_info_tolera_metadata_antiguo_sin_campos_nuevos():
 def test_drift_response_valida_estructura_de_features():
     with pytest.raises(ValidationError):
         DriftResponse(
-            model_version="v", n_reference=1, n_current=1, psi_threshold=0.2,
+            model_version="v",
+            n_reference=1,
+            n_current=1,
+            psi_threshold=0.2,
             features={"a": {"type": "raro", "psi": 0.1, "drift": False}},
-            drifted_features=[], drift_detected=False,
+            drifted_features=[],
+            drift_detected=False,
         )

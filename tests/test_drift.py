@@ -155,7 +155,11 @@ def test_drift_report_marca_drift_solo_por_predicciones():
     cur = generate_dataset(3000, seed=9)
     rng = np.random.default_rng(8)
     report = drift_report(
-        ref, cur, NUM, CAT, reference_scores=rng.beta(2, 8, 3000),
+        ref,
+        cur,
+        NUM,
+        CAT,
+        reference_scores=rng.beta(2, 8, 3000),
         current_scores=rng.beta(8, 2, 3000),
     )
     assert report["drifted_features"] == []
@@ -169,8 +173,13 @@ def test_drift_report_estructura_y_umbral():
     cur["monthly_charges"] = cur["monthly_charges"] * 2.0 + 40
     report = drift_report(ref, cur, NUM, CAT, psi_threshold=50.0)
     assert set(report) == {
-        "n_reference", "n_current", "psi_threshold", "features", "drifted_features",
-        "predictions", "drift_detected",
+        "n_reference",
+        "n_current",
+        "psi_threshold",
+        "features",
+        "drifted_features",
+        "predictions",
+        "drift_detected",
     }
     assert report["n_reference"] == 2000 and report["n_current"] == 2000
     assert report["psi_threshold"] == 50.0

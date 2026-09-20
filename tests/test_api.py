@@ -55,8 +55,14 @@ def test_health_live_responde_aunque_no_haya_modelo(client_sin_modelo):
 
 def test_openapi_expone_todos_los_endpoints(client):
     paths = client.get("/openapi.json").json()["paths"]
-    assert {"/health", "/predict", "/predict/batch", "/model/info", "/model/reload",
-            "/monitoring/drift"} <= set(paths)
+    assert {
+        "/health",
+        "/predict",
+        "/predict/batch",
+        "/model/info",
+        "/model/reload",
+        "/monitoring/drift",
+    } <= set(paths)
     assert client.get("/docs").status_code == 200
 
 
@@ -289,8 +295,11 @@ def test_model_versions_lista_las_publicadas(client_factory, train_small):
     assert body["serving"] == v1  # ...pero este proceso sigue sirviendo la anterior hasta el reload
     assert [v["version"] for v in body["versions"]] == [v1, v2]
     assert body["versions"][1] == {
-        "version": v2, "current": True, "complete": True,
-        "trained_at": body["versions"][1]["trained_at"], "roc_auc": body["versions"][1]["roc_auc"],
+        "version": v2,
+        "current": True,
+        "complete": True,
+        "trained_at": body["versions"][1]["trained_at"],
+        "roc_auc": body["versions"][1]["roc_auc"],
     }
     assert body["versions"][1]["roc_auc"] > 0.5
 
@@ -328,9 +337,12 @@ def test_rollback_a_una_version_concreta(client_factory, train_small):
     assert c.get("/health").json()["model_version"] == v2
     assert c.post("/model/rollback", json={"version": v3}, headers=ADMIN_HEADERS).status_code == 200
     assert c.get("/health").json()["model_version"] == v3
-    assert v1 in c.post("/model/rollback", json={"version": v1}, headers=ADMIN_HEADERS).json()[
-        "available_versions"
-    ]
+    assert (
+        v1
+        in c.post("/model/rollback", json={"version": v1}, headers=ADMIN_HEADERS).json()[
+            "available_versions"
+        ]
+    )
 
 
 def test_rollback_errores(client_factory):
