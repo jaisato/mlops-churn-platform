@@ -25,3 +25,17 @@ src = ["src", "tests", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"  # los stubs de numpy usan sintaxis 3.12; es el runtime de Docker y CI
+files = ["src/churn"]
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.mutmut]
+# Mutation testing sobre los modulos puros (sin entrenar modelos): `make mutation`
+paths_to_mutate = ["src/churn/monitoring/", "src/churn/data/"]
+tests_dir = ["tests/"]

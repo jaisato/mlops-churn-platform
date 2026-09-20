@@ -1,4 +1,4 @@
-.PHONY: install lock lint test coverage train run up down logs retrain drift
+.PHONY: install lock lint format typecheck test coverage check audit mutation train run up down logs retrain drift
 
 install:            ## Dependencias de desarrollo (versiones fijadas en el lockfile)
 	pip install -r requirements-dev.lock
@@ -7,14 +7,29 @@ lock:               ## Regenera los lockfiles a partir de requirements*.txt (nec
 	uv pip compile requirements.txt -o requirements.lock --universal --python-version 3.11
 	uv pip compile requirements-dev.txt -o requirements-dev.lock --universal --python-version 3.11
 
-lint:
+lint:               ## ruff: reglas + formato
 	ruff check .
+	ruff format --check .
+
+format:             ## Aplica el formato de ruff
+	ruff format .
+
+typecheck:
+	mypy src/churn
 
 test:
 	pytest -v
 
 coverage:           ## Tests con informe de cobertura (mismo umbral que CI)
 	pytest --cov=churn --cov-report=term-missing --cov-fail-under=90
+
+check: lint typecheck coverage   ## Todo lo que ejecuta el CI (salvo Docker)
+
+audit:              ## Vulnerabilidades conocidas en las dependencias de produccion
+	pip-audit -r requirements.lock
+
+mutation:           ## Mutation testing de los modulos puros (lento; ver [tool.mutmut])
+	mutmut run
 
 train:              ## Entrena en local (sin Docker) y deja artefactos en ./models
 	PYTHONPATH=src python -m churn.training.train --rows 20000 --model-dir models

@@ -72,11 +72,20 @@ jobs:
           ping -c 2 ${{ secrets.DEPLOY_HOST }} || true
 
       - name: Preparar clave SSH
+        env:
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
         run: |
           umask 077
           mkdir -p ~/.ssh
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          if [ -n "$DEPLOY_HOST_KEY" ]; then
+            # Huella del VPS fijada como secreto (salida de `ssh-keyscan -t ed25519 <host>`):
+            # un tercero en la ruta no puede suplantar el servidor.
+            echo "$DEPLOY_HOST_KEY" >> ~/.ssh/known_hosts
+          else
+            echo "::warning::DEPLOY_HOST_KEY no definido; se acepta la huella del host en el primer contacto"
+            ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          fi
 
       - name: Desplegar en el VPS (docker compose pull + up + healthcheck)
         run: |

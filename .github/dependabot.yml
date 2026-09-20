@@ -1,0 +1,20 @@
+# Avisos semanales de versiones nuevas. Las dependencias Python se fijan en los lockfiles
+# (`make lock`), asi que aqui Dependabot vigila los rangos de requirements*.txt, las
+# acciones de los workflows y la imagen base del Dockerfile.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
