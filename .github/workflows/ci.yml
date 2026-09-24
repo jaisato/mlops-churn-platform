@@ -90,7 +90,7 @@ jobs:
           docker compose -f docker-compose.prod.yml --profile train config -q
 
       - name: Build de validacion (sin push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
