@@ -63,40 +63,65 @@ jobs:
     environment: production
     concurrency: deploy-production
     steps:
+      # Secretos e inputs llegan a los scripts por `env`, nunca interpolados con `${{ }}`
+      # dentro de `run:`: la interpolacion se hace antes de que el shell vea el texto, asi que
+      # un valor con `;`, comillas o `$(...)` se ejecutaria en el runner (y via ssh en el VPS).
       - name: Levantar tunel WireGuard hacia la red privada de netcup
+        env:
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           sudo apt-get update -y && sudo apt-get install -y wireguard-tools
           umask 077
-          echo "${{ secrets.WG_CONFIG }}" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          printf '%s\n' "$WG_CONFIG" | sudo tee /etc/wireguard/wg0.conf > /dev/null
           sudo wg-quick up wg0
-          ping -c 2 ${{ secrets.DEPLOY_HOST }} || true
+          ping -c 2 "$DEPLOY_HOST" || true
 
       - name: Preparar clave SSH
         env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           umask 077
           mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           if [ -n "$DEPLOY_HOST_KEY" ]; then
             # Huella del VPS fijada como secreto (salida de `ssh-keyscan -t ed25519 <host>`):
             # un tercero en la ruta no puede suplantar el servidor.
             echo "$DEPLOY_HOST_KEY" >> ~/.ssh/known_hosts
           else
             echo "::warning::DEPLOY_HOST_KEY no definido; se acepta la huella del host en el primer contacto"
-            ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+            ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
           fi
 
       - name: Desplegar en el VPS (docker compose pull + up + healthcheck)
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          BUILT_VERSION: ${{ needs.build-push.outputs.version }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
-          VERSION="${{ github.event.inputs.tag || needs.build-push.outputs.version }}"
+          VERSION="${INPUT_TAG:-$BUILT_VERSION}"
           VERSION="${VERSION#v}"   # las imagenes se etiquetan sin la "v" (semver)
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
-            "cd /opt/mlops-churn-platform && TAG=$VERSION ./deploy/scripts/deploy.sh"
+          # Solo tags que puede producir build-push: latest, X.Y.Z[-pre] o sha-<hash>. El valor
+          # viaja dentro del comando remoto de ssh, asi que cualquier otra cosa se rechaza.
+          # `[[ =~ ]]` valida la cadena entera; grep iria linea a linea y un input con salto de
+          # linea ("latest" + otra linea con un comando) pasaria el filtro.
+          re='^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?|sha-[0-9a-f]{7,40})$'
+          if [[ ! "$VERSION" =~ $re ]]; then
+            echo "::error::Tag de imagen no valido: se espera latest, X.Y.Z o sha-<hash>"
+            exit 1
+          fi
+          ssh -i ~/.ssh/id_ed25519 "$DEPLOY_USER@$DEPLOY_HOST" \
+            "cd /opt/mlops-churn-platform && TAG='$VERSION' ./deploy/scripts/deploy.sh"
 
       - name: Smoke test post-despliegue
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+          ssh -i ~/.ssh/id_ed25519 "$DEPLOY_USER@$DEPLOY_HOST" \
             "curl -fsS --max-time 10 http://localhost:8010/health" \
             && echo 'Despliegue verificado'
 
