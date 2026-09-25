@@ -1,6 +1,12 @@
 # Avisos semanales de versiones nuevas. Las dependencias Python se fijan en los lockfiles
 # (`make lock`), asi que aqui Dependabot vigila los rangos de requirements*.txt, las
 # acciones de los workflows y la imagen base del Dockerfile.
+#
+# Dependabot solo edita requirements*.txt, no los lockfiles, y la CI y la imagen instalan
+# desde los lockfiles: un salto de version mayor en los rangos dejaba el CI en verde sin
+# probar lo declarado (paso con mlflow 3 y pandas 3 frente a 2.22 y 2.3 en el lock). Por eso
+# se ignoran las versiones mayores: se actualizan a mano regenerando el lock (`make lock`),
+# probando la imagen y, en el caso de MLflow, alineando la version del servidor.
 version: 2
 updates:
   - package-ecosystem: pip
@@ -10,6 +16,9 @@ updates:
     groups:
       python-dependencies:
         patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
