@@ -7,6 +7,12 @@
 # probar lo declarado (paso con mlflow 3 y pandas 3 frente a 2.22 y 2.3 en el lock). Por eso
 # se ignoran las versiones mayores: se actualizan a mano regenerando el lock (`make lock`),
 # probando la imagen y, en el caso de MLflow, alineando la version del servidor.
+#
+# El `ignore` por `update-types` no frena a las actualizaciones agrupadas (la #11 volvio a
+# proponer mlflow 3 y pandas 3 con esa regla activa), asi que el grupo se limita a versiones
+# menores y de parche, y los dos paquetes con salto pendiente se ignoran ademas por version.
+# La imagen base del Dockerfile se mantiene en la serie 3.12 hasta que el lock tenga wheels
+# para 3.14 (pyarrow no las tiene y la #8 fallo al construir).
 version: 2
 updates:
   - package-ecosystem: pip
@@ -16,9 +22,14 @@ updates:
     groups:
       python-dependencies:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      - dependency-name: "pandas"
+        versions: [">=3"]
+      - dependency-name: "mlflow"
+        versions: [">=3"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -27,3 +38,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
