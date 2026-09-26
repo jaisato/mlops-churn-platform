@@ -1,7 +1,7 @@
 -r requirements.txt
 pytest>=9.1.1
 pytest-cov>=7.1.0
-hypothesis>=6.168.0
+hypothesis>=6.168.1
 mutmut>=3.8.0
 ruff>=0.16.8
 mypy>=2.3.1
