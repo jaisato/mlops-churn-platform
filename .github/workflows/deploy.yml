@@ -35,7 +35,7 @@ jobs:
 
       - name: Metadatos de imagen (tags)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # `latest` se publica en cada release (tag v*) y en builds manuales desde la rama
