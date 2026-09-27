@@ -100,7 +100,7 @@ httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
     # via -r requirements-dev.txt
-hypothesis==6.168.0
+hypothesis==6.168.2
     # via -r requirements-dev.txt
 idna==3.20
     # via
