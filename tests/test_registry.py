@@ -9,6 +9,7 @@ import sklearn
 from churn.data.generator import CATEGORICAL_FEATURES, NUMERIC_FEATURES
 from churn.registry import (
     ARTIFACT_FILES,
+    SERVED_FILE,
     LoadedModel,
     LocalModelStore,
     ModelArtifactError,
@@ -83,7 +84,9 @@ def test_save_publica_una_version_y_la_deja_en_servicio(store):
     assert store.exists()
     assert store.current_version() == "v1"
     assert store.current_file.read_text().strip() == "v1"
-    assert sorted(p.name for p in store.version_dir("v1").iterdir()) == sorted(ARTIFACT_FILES)
+    assert sorted(p.name for p in store.version_dir("v1").iterdir()) == sorted(
+        (*ARTIFACT_FILES, SERVED_FILE)
+    )
     assert store.model_path == store.version_dir("v1") / "model.joblib"
 
 
@@ -279,6 +282,38 @@ def test_retadores_rechazados_no_desalojan_a_los_campeones(store):
     assert {"v1", "v2"} <= set(versions)
     assert "r1" not in versions  # los rechazados si respetan la ventana
     assert store.rollback() == "v1"
+
+
+def test_rechazado_que_llego_a_servir_cuenta_como_servido(store):
+    # Un operador hace rollback explicito a un retador rechazado: sirve trafico, asi que
+    # despues es un destino valido de rollback y la retencion no debe desalojarlo.
+    _publish(store, "v1")
+    _publish_rejected(store, "v2")
+    assert store.has_served("v2") is False
+    store.rollback("v2")
+    assert store.has_served("v2") is True
+    assert store.is_rejected("v2")  # la decision del entrenamiento no cambia
+    _publish(store, "v3")
+    for v in ["x1", "x2", "x3", "x4"]:
+        _publish_rejected(store, v)
+    assert {"v1", "v2", "v3"} <= set(store.list_versions())
+
+
+def test_rollback_por_defecto_vuelve_a_un_rechazado_que_sirvio(store):
+    _publish(store, "v1")
+    _publish_rejected(store, "v2")
+    store.rollback("v2")
+    _publish(store, "v3")
+    assert store.rollback() == "v2"
+    assert store.rollback() == "v1"
+
+
+def test_la_marca_de_servicio_sobrevive_a_save_metadata(store):
+    _publish(store, "v1")
+    _publish_rejected(store, "v2")
+    store.rollback("v2")
+    store.save_metadata(_metadata("v2", trained_at="t-v2", promotion={"decision": "rejected"}))
+    assert store.has_served("v2") is True
 
 
 def test_rollback_a_una_version_concreta_en_cualquier_direccion(store):

@@ -27,6 +27,7 @@ import platform
 import shutil
 import tempfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,10 @@ VERSIONS_DIR = "versions"
 DEFAULT_KEEP_VERSIONS = 5
 #: `metadata["promotion"]["decision"]` de un retador que no supero al campeon.
 REJECTED_DECISION = "rejected"
+#: Marca dentro de `versions/<v>/` que registra que esa version llego a servir trafico.
+#: Va aparte de metadata.json para que `save_metadata` (que reescribe el metadata con el
+#: dict del llamador) no la borre.
+SERVED_FILE = ".served"
 
 
 class ModelArtifactError(RuntimeError):
@@ -191,6 +196,19 @@ class LocalModelStore:
         promotion = self._read_metadata(version).get("promotion")
         return isinstance(promotion, dict) and promotion.get("decision") == REJECTED_DECISION
 
+    def has_served(self, version: str) -> bool:
+        """True si la version llego a estar en servicio.
+
+        La decision de promocion es la foto del entrenamiento; si un operador hace rollback
+        explicito a un retador rechazado, ese modelo sirve trafico y desde entonces es un
+        destino valido de rollback que la retencion debe conservar. Se registra con
+        `SERVED_FILE` al mover el puntero. Las versiones sin marca (anteriores a ella) se
+        consideran servidas salvo que sean retadores rechazados.
+        """
+        if (self.version_dir(version) / SERVED_FILE).exists():
+            return True
+        return not self.is_rejected(version)
+
     def has_legacy_layout(self) -> bool:
         return all((self.model_dir / name).exists() for name in ARTIFACT_FILES)
 
@@ -272,17 +290,24 @@ class LocalModelStore:
         tmp = self.current_file.with_suffix(".tmp")
         tmp.write_text(version + "\n", encoding="utf-8")
         os.replace(tmp, self.current_file)
+        self._mark_served(version)
+
+    def _mark_served(self, version: str) -> None:
+        directory = self.version_dir(version)
+        marker = directory / SERVED_FILE
+        if directory.is_dir() and not marker.exists():
+            marker.write_text(datetime.now(UTC).isoformat() + "\n", encoding="utf-8")
 
     def prune(self) -> list[str]:
         """Borra las versiones mas antiguas que exceden `keep_versions`; nunca la actual.
 
         La ventana se cuenta dos veces: sobre todas las versiones y sobre las que llegaron a
-        servirse (no rechazadas). Asi unos cuantos retadores rechazados seguidos (drift
+        servirse (`has_served`). Asi unos cuantos retadores rechazados seguidos (drift
         semanal sin datos mejores) no desalojan a los campeones anteriores, que son los
         destinos utiles de un rollback.
         """
         versions = self.list_versions()
-        eligible = [v for v in versions if not self.is_rejected(v)]
+        eligible = [v for v in versions if self.has_served(v)]
         keep = set(versions[-self.keep_versions :]) | set(eligible[-self.keep_versions :])
         current = self.current_version()
         if current:
@@ -335,8 +360,8 @@ class LocalModelStore:
     def resolve_rollback_target(self, version: str | None = None) -> str:
         """Version a la que volver: la indicada, o la inmediatamente anterior a la actual.
 
-        Por defecto se salta los retadores rechazados: perdieron contra el campeon de su
-        momento y nunca sirvieron trafico, asi que "volver" a ellos seria desplegar un
+        Por defecto se salta los retadores rechazados que nunca sirvieron trafico: perdieron
+        contra el campeon de su momento, asi que "volver" a ellos seria desplegar un
         modelo que ya se midio como peor. Siguen disponibles pidiendo su version explicita.
 
         Lanza `LookupError` si no existe (o no hay anterior) y `ModelArtifactError` si esta
@@ -347,7 +372,7 @@ class LocalModelStore:
         if version is None:
             # "Anterior" por orden de publicacion; sin puntero (layout plano) es la ultima publicada
             position = versions.index(current) if current in versions else len(versions)
-            candidates = [v for v in versions[:position] if not self.is_rejected(v)]
+            candidates = [v for v in versions[:position] if self.has_served(v)]
             if not candidates:
                 raise LookupError("No hay una version anterior a la que volver")
             version = candidates[-1]
