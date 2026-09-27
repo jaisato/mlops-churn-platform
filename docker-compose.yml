@@ -1,6 +1,9 @@
 # Entorno LOCAL: MLflow + entrenamiento + API de scoring.
 # El servicio `trainer` entrena el modelo y termina; `api` arranca cuando el
 # entrenamiento ha finalizado con exito (volumen compartido /models).
+# Los puertos se publican solo en 127.0.0.1: MLflow no tiene autenticacion y la API
+# usa aqui un token de administracion conocido (token-local), asi que no deben quedar
+# accesibles desde la red local.
 services:
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.22.0  # misma familia que el cliente (requirements.txt)
@@ -9,7 +12,7 @@ services:
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --artifacts-destination /mlflow/artifacts
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - mlflow-data:/mlflow
     # Sin healthcheck el trainer arrancaba antes de que MLflow aceptase conexiones
@@ -39,7 +42,7 @@ services:
   api:
     build: .
     ports:
-      - "8010:8000"
+      - "127.0.0.1:8010:8000"
     environment:
       CHURN_ENVIRONMENT: local
       CHURN_MODEL_DIR: /models
