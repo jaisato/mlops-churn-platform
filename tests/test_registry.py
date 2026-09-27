@@ -248,6 +248,39 @@ def test_rollback_por_defecto_vuelve_a_la_anterior(store):
     assert store.rollback() == "v1"  # anterior a la actual, no a la ultima publicada
 
 
+def _publish_rejected(store: LocalModelStore, version: str) -> str:
+    metadata = _metadata(version, trained_at=f"t-{version}", promotion={"decision": "rejected"})
+    return store.save(FakePipeline(version), metadata, REFERENCE, promote=False)
+
+
+def test_rollback_por_defecto_se_salta_los_retadores_rechazados(store):
+    _publish(store, "v1")
+    _publish_rejected(store, "v2")  # perdio contra v1: nunca sirvio trafico
+    _publish(store, "v3")
+    assert store.rollback() == "v1"
+    assert store.rollback("v2") == "v2"  # explicito sigue permitido
+
+
+def test_rollback_sin_campeon_anterior_aunque_haya_rechazados(store):
+    _publish(store, "v1")
+    _publish_rejected(store, "v2")
+    store.set_current("v1")
+    with pytest.raises(LookupError, match="No hay una version anterior"):
+        store.rollback()
+
+
+def test_retadores_rechazados_no_desalojan_a_los_campeones(store):
+    # keep_versions=3: tras cuatro retadores rechazados, los campeones anteriores siguen
+    _publish(store, "v1")
+    _publish(store, "v2")
+    for v in ["r1", "r2", "r3", "r4"]:
+        _publish_rejected(store, v)
+    versions = store.list_versions()
+    assert {"v1", "v2"} <= set(versions)
+    assert "r1" not in versions  # los rechazados si respetan la ventana
+    assert store.rollback() == "v1"
+
+
 def test_rollback_a_una_version_concreta_en_cualquier_direccion(store):
     for v in ["v1", "v2", "v3"]:
         _publish(store, v)
