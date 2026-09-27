@@ -222,8 +222,21 @@ class LocalModelStore:
 
     # ------------------------------------------------------------------ escritura
 
-    def save(self, pipeline: Any, metadata: dict[str, Any], reference: pd.DataFrame) -> str:
-        """Publica una version nueva y la deja en servicio. Devuelve el nombre de la version."""
+    def save(
+        self,
+        pipeline: Any,
+        metadata: dict[str, Any],
+        reference: pd.DataFrame,
+        *,
+        promote: bool = True,
+    ) -> str:
+        """Publica una version nueva. Devuelve el nombre de la version.
+
+        Con `promote=True` (defecto) el puntero `current` pasa a apuntarla. Con
+        `promote=False` los artefactos quedan en `versions/` (auditables, recuperables con
+        rollback) pero el modelo en servicio no cambia: es el caso de un retador que no
+        supera al campeon.
+        """
         version = str(metadata["model_version"])
         self.versions_dir.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=self.versions_dir))
@@ -238,7 +251,8 @@ class LocalModelStore:
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
-        self.set_current(version)
+        if promote:
+            self.set_current(version)
         self.prune()
         return version
 
@@ -338,6 +352,7 @@ class LocalModelStore:
                 "complete": not self.missing_files(version),
                 "trained_at": None,
                 "roc_auc": None,
+                "promotion": None,
             }
             try:
                 meta = json.loads(
@@ -345,6 +360,7 @@ class LocalModelStore:
                 )
                 entry["trained_at"] = meta.get("trained_at")
                 entry["roc_auc"] = (meta.get("metrics") or {}).get("roc_auc")
+                entry["promotion"] = (meta.get("promotion") or {}).get("decision")
             except (OSError, ValueError, AttributeError):
                 pass
             summary.append(entry)

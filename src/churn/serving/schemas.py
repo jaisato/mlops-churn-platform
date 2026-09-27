@@ -65,6 +65,30 @@ class QualityGate(BaseModel):
     passed: bool
 
 
+PromotionDecision = Literal["promoted", "rejected", "no_champion"]
+
+
+class Promotion(BaseModel):
+    """Resultado de la comparacion campeon/retador al entrenar esta version."""
+
+    decision: PromotionDecision
+    margin: float
+    challenger_roc_auc: float
+    champion_version: str | None = None
+    champion_roc_auc: float | None = None
+    identical_training_data: bool = False
+    reason: str
+
+
+class DataSource(BaseModel):
+    kind: Literal["synthetic", "file", "dataframe"]
+    rows: int
+    fingerprint: str
+    path: str | None = None
+    seed: int | None = None
+    drift_shift: float | None = None
+
+
 class ModelInfoResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -77,6 +101,8 @@ class ModelInfoResponse(BaseModel):
     code_version: str | None = None
     seed: int | None = None
     quality_gate: QualityGate | None = None
+    promotion: Promotion | None = None
+    data_source: DataSource | None = None
     runtime: dict[str, str] | None = None
     mlflow_run_id: str | None = None
     mlflow_model_version: str | None = None
@@ -96,6 +122,9 @@ class ModelVersionInfo(BaseModel):
     complete: bool
     trained_at: str | None = None
     roc_auc: float | None = None
+    promotion: PromotionDecision | None = Field(
+        None, description="Decision campeon/retador al entrenarla (None en versiones antiguas)"
+    )
 
 
 class ModelVersionsResponse(BaseModel):

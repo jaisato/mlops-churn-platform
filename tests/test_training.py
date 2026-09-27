@@ -22,6 +22,7 @@ from churn.training.train import (
     runtime_versions,
     train,
 )
+from tests.conftest import SMALL_ROWS, weak_pipeline
 
 
 def test_entrenamiento_genera_artefactos(tmp_path):
@@ -203,7 +204,7 @@ def _install_fake_mlflow(
     fake.set_experiment = lambda name: calls.__setitem__("experiment", name)
     fake.start_run = start_run
     fake.log_params = lambda params: calls.__setitem__("params", params)
-    fake.log_metrics = lambda metrics: calls.__setitem__("metrics", metrics)
+    fake.log_metrics = lambda metrics: calls.setdefault("metrics", {}).update(metrics)
     fake.MlflowClient = FakeClient
     fake_sklearn.log_model = log_model
     fake.sklearn = fake_sklearn
@@ -256,6 +257,12 @@ def test_mlflow_ok_registra_run_alias_y_lo_persiste(tmp_path, monkeypatch, train
     assert calls["run_name"] == f"train-{metadata['model_version']}"
     assert calls["params"]["seed"] == 31 and calls["params"]["min_roc_auc"] == 0.75
     assert calls["params"]["scikit_learn"] == sklearn.__version__
+    assert calls["params"]["promotion_decision"] == "no_champion"
+    assert calls["params"]["promotion_margin"] == 1.0  # train_small desactiva la comparacion
+    assert calls["params"]["champion_version"] is None
+    assert calls["params"]["data_kind"] == "dataframe"
+    assert calls["params"]["data_fingerprint"] == metadata["data_source"]["fingerprint"]
+    assert "champion_roc_auc" not in calls["metrics"]
     assert calls["metrics"]["roc_auc"] == metadata["metrics"]["roc_auc"]
     assert calls["log_model"]["registered_model_name"] == "churn-classifier"
     assert len(calls["log_model"]["input_example"]) == 5
@@ -302,6 +309,41 @@ def test_mlflow_alias_desactivado_por_configuracion(tmp_path, monkeypatch, train
     assert metadata["mlflow_model_version"] is None
 
 
+def test_mlflow_registra_al_campeon_y_al_retador_promovido(tmp_path, monkeypatch, train_small):
+    _settings_con_mlflow(monkeypatch)
+    calls = _install_fake_mlflow(monkeypatch, registered_version="4")
+    campeon = train_small(tmp_path, seed=36)
+    retador = train_small(tmp_path, seed=37)  # margen 1.0: se promueve
+    assert calls["params"]["promotion_decision"] == "promoted"
+    assert calls["params"]["champion_version"] == campeon["model_version"]
+    assert calls["metrics"]["champion_roc_auc"] == retador["promotion"]["champion_roc_auc"]
+    assert calls["alias"] == ("churn-classifier", "champion", "4")
+
+
+def test_mlflow_registra_el_run_pero_no_mueve_el_alias_si_no_promueve(
+    tmp_path, monkeypatch, train_small, caplog
+):
+    _settings_con_mlflow(monkeypatch)
+    calls = _install_fake_mlflow(monkeypatch, registered_version="5")
+    train_small(tmp_path, seed=38)
+    calls.clear()
+    monkeypatch.setattr(train_module, "build_pipeline", weak_pipeline)
+    df = generate_dataset(SMALL_ROWS, seed=39)
+    metadata = train(df, model_dir=str(tmp_path), seed=39, min_roc_auc=0.5)
+    assert metadata["promotion"]["decision"] == "rejected"
+    assert calls["params"]["promotion_decision"] == "rejected"
+    assert "alias" not in calls
+    assert metadata["mlflow_run_id"] == "run-abc123"
+    assert metadata["mlflow_model_version"] is None
+    assert "el alias de campeon no cambia" in caplog.text
+    persisted = json.loads(
+        (
+            LocalModelStore(tmp_path).version_dir(metadata["model_version"]) / "metadata.json"
+        ).read_text()
+    )
+    assert persisted["mlflow_run_id"] == "run-abc123"
+
+
 # ------------------------------------------------------------------ CLI
 
 
@@ -317,3 +359,46 @@ def test_cli_gate_fallido_devuelve_2_sin_artefactos(tmp_path):
     code = main(argv)
     assert code == 2
     assert not LocalModelStore(tmp_path).exists()
+
+
+def test_cli_registra_la_fuente_sintetica_y_el_drift_shift(tmp_path):
+    argv = ["--rows", "800", "--seed", "5", "--drift-shift", "1.0", "--model-dir", str(tmp_path)]
+    assert main(argv) == 0
+    metadata = LocalModelStore(tmp_path).load().metadata
+    assert metadata["data_source"]["kind"] == "synthetic"
+    assert metadata["data_source"]["seed"] == 5
+    assert metadata["data_source"]["drift_shift"] == 1.0
+    assert metadata["data_source"]["rows"] == 800
+
+
+def test_cli_entrena_desde_un_fichero(tmp_path, capsys):
+    data = tmp_path / "clientes.parquet"
+    generate_dataset(900, seed=6).to_parquet(data, index=False)
+    argv = ["--data", str(data), "--seed", "6", "--model-dir", str(tmp_path / "models")]
+    assert main(argv) == 0
+    assert "(no_champion)" in capsys.readouterr().out
+    metadata = LocalModelStore(tmp_path / "models").load().metadata
+    assert metadata["data_source"]["kind"] == "file"
+    assert metadata["data_source"]["path"] == str(data)
+    assert metadata["data_source"]["rows"] == 900
+    assert metadata["metrics"]["n_train"] + metadata["metrics"]["n_test"] == 900
+
+
+def test_cli_fichero_inexistente_devuelve_2(tmp_path, capsys):
+    assert main(["--data", str(tmp_path / "nada.csv"), "--model-dir", str(tmp_path)]) == 2
+    assert "no disponibles" in capsys.readouterr().out  # el log JSON va a stdout
+    assert not (tmp_path / "versions").exists()
+
+
+def test_cli_rechaza_drift_shift_con_fichero(tmp_path):
+    data = tmp_path / "clientes.csv"
+    generate_dataset(600, seed=6).to_csv(data, index=False)
+    argv = ["--data", str(data), "--drift-shift", "0.5", "--model-dir", str(tmp_path)]
+    assert main(argv) == 2
+
+
+def test_cli_fichero_con_datos_invalidos_devuelve_2(tmp_path, capsys):
+    data = tmp_path / "sin_etiqueta.csv"
+    generate_dataset(600, seed=6).drop(columns=["churn"]).to_csv(data, index=False)
+    assert main(["--data", str(data), "--model-dir", str(tmp_path)]) == 2
+    assert "Faltan columnas" in capsys.readouterr().out

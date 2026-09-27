@@ -24,9 +24,12 @@ services:
 
   trainer:
     build: .
+    # Entrenamiento inicial con datos sinteticos. Para reentrenar con otros datos:
+    # `make retrain DATA=data/churn-q3.csv` (monta el fichero y pasa `--data`).
     command: python -m churn.training.train --rows 20000 --model-dir /models
     environment:
       CHURN_MLFLOW_TRACKING_URI: http://mlflow:5000
+      CHURN_PROMOTION_MARGIN: ${CHURN_PROMOTION_MARGIN:-0}
     volumes:
       - models:/models
     depends_on:
