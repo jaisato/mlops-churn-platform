@@ -26,10 +26,14 @@ services:
   trainer:
     image: ${IMAGE_REGISTRY:-ghcr.io}/${GITHUB_OWNER:?definir}/mlops-churn-platform:${TAG:-latest}
     profiles: ["train"]
+    # Comando por defecto = entrenamiento INICIAL con datos sinteticos (deploy.sh lo usa
+    # cuando el volumen esta vacio). Reentrenar con datos reales es otra invocacion:
+    # retrain-if-drift.sh monta CHURN_TRAIN_DATA y pasa `--data` (ver el script).
     command: python -m churn.training.train --rows 50000 --model-dir /models
     environment:
       CHURN_MLFLOW_TRACKING_URI: http://mlflow:5000
       CHURN_MIN_ROC_AUC: ${CHURN_MIN_ROC_AUC:-0.75}             # gate de calidad del reentreno
+      CHURN_PROMOTION_MARGIN: ${CHURN_PROMOTION_MARGIN:-0}      # campeon/retador (0 = al menos igual)
       CHURN_MODEL_KEEP_VERSIONS: ${CHURN_MODEL_KEEP_VERSIONS:-5}
     volumes:
       - models:/models

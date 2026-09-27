@@ -113,6 +113,8 @@ Edita `.env`:
 | `VPN_BIND_IP`       | IP del VPS dentro de la VPN (`10.8.0.1`). Obligatoria.                  |
 | `CHURN_API_KEY`     | Opcional. Si se define, scoring, `/model/info`, `/model/versions` y drift exigen `X-API-Key`. |
 | `WEBHOOK_URL`       | Opcional. Webhook (Slack/Mattermost) para los avisos de `retrain-if-drift.sh`. |
+| `CHURN_TRAIN_DATA`  | Ruta en el host a un `.csv`/`.parquet` **etiquetado** (features + columna `churn`) con el que reentrenar. Sin ella `retrain-if-drift.sh` avisa y no reentrena. |
+| `CHURN_PROMOTION_MARGIN` | Opcional (`0`). Margen de AUC que se le concede al modelo nuevo frente al que esta en servicio. |
 
 Y despliega:
 
@@ -155,8 +157,9 @@ Configura en *Settings -> Secrets and variables -> Actions*:
 | Rollback de **modelo**  | `curl -X POST localhost:8010/model/rollback -H "X-Admin-Token: $CHURN_ADMIN_TOKEN"` (a la version anterior; `-d '{"version": "..."}'` para una concreta) |
 | Versiones publicadas    | `curl localhost:8010/model/versions`                                    |
 | Version en servicio     | `cat .current_tag` (imagen) y `curl localhost:8010/health` (modelo)     |
-| Reentrenar a mano       | `docker compose -f docker-compose.prod.yml --profile train run --rm trainer` y despues `curl -fsS -X POST localhost:8010/model/reload -H "X-Admin-Token: $CHURN_ADMIN_TOKEN"`. Si el modelo nuevo no supera el gate (`CHURN_MIN_ROC_AUC`), el trainer termina con codigo 2 y el modelo en servicio no se toca. |
-| Reentrenar por drift    | `deploy/scripts/retrain-if-drift.sh` (ver cron abajo; `FORCE=1` fuerza el reentreno) |
+| Reentrenar a mano       | `CHURN_TRAIN_DATA=/ruta/clientes_q3.parquet FORCE=1 deploy/scripts/retrain-if-drift.sh`: monta el fichero en el trainer, entrena con `--data`, compara con el modelo en servicio y recarga la API solo si el nuevo se promueve. Codigos del trainer: 0 promovido, 2 datos invalidos o gate (`CHURN_MIN_ROC_AUC`) no superado, 3 entrenado pero no promovido (el actual sigue en servicio). |
+| Reentrenar por drift    | `deploy/scripts/retrain-if-drift.sh` (cron abajo). Consulta `/monitoring/drift` y, si hay drift, reentrena con `CHURN_TRAIN_DATA`; **sin datos etiquetados nuevos no reentrena** (codigo 3 y aviso): reentrenar con el generador sintetico produciria el mismo modelo. |
+| Entrenamiento inicial   | Lo hace `deploy.sh` con datos sinteticos cuando el volumen esta vacio (`docker compose -f docker-compose.prod.yml --profile train run --rm trainer`). |
 | Drift                   | `curl -s localhost:8010/monitoring/drift \| python3 -m json.tool`       |
 | Metricas                | `curl -s localhost:8010/metrics` (Prometheus; apuntar un scraper dentro de la VPN) |
 | Logs                    | `docker compose -f docker-compose.prod.yml logs -f --tail 100` (JSON, una linea por peticion con `request_id`) |
@@ -175,9 +178,16 @@ Notas:
 - `deploy.sh` da prioridad al `TAG` pasado por el invocador sobre el de `.env`.
 - El estado del despliegue vive en `.current_tag` (tag en servicio) y `.previous_tag`
   (destino del rollback); ambos estan ignorados por git.
-- El alias `champion` de MLflow apunta siempre a la **ultima version que supero el gate**;
-  tras un rollback de modelo en la API el alias no cambia (la API no habla con MLflow por
-  diseno). `/model/versions` es la fuente de verdad de lo que hay en servicio.
+- El alias `champion` de MLflow apunta siempre a la **ultima version promovida** (supero el
+  gate y no fue peor que el modelo en servicio sobre los datos nuevos); las versiones
+  entrenadas pero no promovidas quedan registradas en MLflow sin alias y en
+  `/models/versions/` con `promotion.decision = rejected`. Tras un rollback de modelo en la
+  API el alias no cambia (la API no habla con MLflow por diseno). `/model/versions` es la
+  fuente de verdad de lo que hay en servicio.
+- Las etiquetas (`churn` real) llegan del negocio semanas despues de la prediccion: el
+  fichero de `CHURN_TRAIN_DATA` hay que construirlo fuera de la plataforma (export del CRM
+  o del warehouse con las mismas columnas que el contrato de la API). Para ensayar el ciclo
+  sin datos reales: `python scripts/generate_data.py --drift-shift 1.0 --out data/churn-drift.csv`.
 - Tras reconstruir la imagen con otra version menor de scikit-learn, la API rechazara los
   modelos antiguos (503 + motivo en el log). Reentrena, o arranca con
   `CHURN_STRICT_ARTIFACT_COMPAT=false` si asumes el riesgo.
