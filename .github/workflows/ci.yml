@@ -25,7 +25,8 @@ jobs:
       ruff-format: true
       run-mypy: true
       mypy-paths: src/churn
-      coverage-min: 90
+      # La cobertura real es del 100 %; el umbral pasa de 90 a 100 para que no baje.
+      coverage-min: 100
       coverage-source: churn
       extra-test-args: -v
       run-pip-audit: true
