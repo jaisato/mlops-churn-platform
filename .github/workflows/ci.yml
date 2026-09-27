@@ -1,3 +1,7 @@
+# CI: la parte Python (ruff, mypy, pytest con cobertura, pip-audit, build de la
+# imagen) la ejecuta el workflow reutilizable de jaisato/.github; aquí solo
+# quedan las comprobaciones propias de este repositorio (scripts de despliegue,
+# Dockerfile y ficheros compose).
 name: CI
 
 on:
@@ -5,80 +9,49 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  lint:
-    name: Lint, tipos y scripts
+  python:
+    name: Python
+    uses: jaisato/.github/.github/workflows/python-ci.yml@main
+    with:
+      python-versions: '["3.11", "3.12", "3.13"]'
+      # mypy necesita 3.12: los stubs de numpy usan sintaxis 3.12 (ver pyproject).
+      tools-python-version: "3.12"
+      install-command: pip install -r requirements-dev.lock
+      ruff-paths: .
+      ruff-format: true
+      run-mypy: true
+      mypy-paths: src/churn
+      coverage-min: 90
+      coverage-source: churn
+      extra-test-args: -v
+      run-pip-audit: true
+      # Informativo (pip-audit-strict=false): una CVE sin parche aguas arriba no
+      # bloquea el resto del CI, pero queda visible en el job.
+      pip-audit-args: -r requirements.lock
+      docker-build: true
+
+  repo-checks:
+    name: Scripts de despliegue, Dockerfile y compose
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
-          cache: pip
-      - name: Instalar dependencias (lockfile)
-        run: pip install -r requirements-dev.lock
-      - name: ruff (lint + formato)
-        run: |
-          ruff check .
-          ruff format --check .
-      - name: mypy
-        run: mypy src/churn
+          persist-credentials: false
+
       - name: Scripts de despliegue (bash -n + shellcheck)
         run: |
           bash -n deploy/scripts/*.sh
-          docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck:stable -S warning deploy/scripts/*.sh
+          shellcheck -S warning deploy/scripts/*.sh
+
       - name: Workflows (actionlint)
-        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest
+        run: pipx run --spec 'actionlint-py==1.7.12.25' actionlint -no-color .github/workflows/*.yml
+
       - name: Dockerfile (hadolint)
         run: docker run --rm -i hadolint/hadolint:latest < Dockerfile
-
-  test:
-    name: Tests (python ${{ matrix.python }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python }}
-          cache: pip
-      - name: Instalar dependencias (lockfile)
-        run: pip install -r requirements-dev.lock
-      - name: pytest + cobertura (minimo 90%)
-        run: pytest -v --cov=churn --cov-report=term-missing --cov-report=xml --cov-fail-under=90
-      - name: Subir informe de cobertura
-        if: always() && matrix.python == '3.12'
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage-xml
-          path: coverage.xml
-
-  audit:
-    name: Auditoria de dependencias
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - name: pip-audit sobre el lockfile de produccion
-        # Informativo: una CVE sin parche aguas arriba no debe bloquear el resto del CI,
-        # pero queda visible en el job.
-        continue-on-error: true
-        run: |
-          pip install pip-audit
-          pip-audit -r requirements.lock --progress-spinner off
-
-  docker-build:
-    name: Compose y build de la imagen
-    runs-on: ubuntu-latest
-    needs: [lint, test]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
 
       - name: Validar ficheros compose (local y produccion)
         env:
@@ -88,12 +61,3 @@ jobs:
         run: |
           docker compose -f docker-compose.yml config -q
           docker compose -f docker-compose.prod.yml --profile train config -q
-
-      - name: Build de validacion (sin push)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          tags: mlops-churn-platform:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
