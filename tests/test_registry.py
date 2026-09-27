@@ -287,6 +287,7 @@ def test_describe_versions(store):
         "complete": True,
         "trained_at": "t-v2",
         "roc_auc": None,
+        "promotion": None,
     }
     assert described[0]["current"] is False and described[0]["trained_at"] is None
 

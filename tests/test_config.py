@@ -13,6 +13,7 @@ def test_valores_por_defecto():
     assert (s.risk_medium, s.risk_high) == (0.35, 0.65)
     assert (s.drift_min_rows, s.drift_buffer_size, s.psi_alert_threshold) == (200, 5000, 0.2)
     assert s.min_roc_auc == 0.75
+    assert s.promotion_margin == 0.0
     assert s.is_production is False
 
 
@@ -74,3 +75,12 @@ def test_entornos_no_productivos_toleran_el_token_por_defecto(env):
 
 def test_get_settings_esta_cacheado():
     assert get_settings() is get_settings()
+
+
+def test_margen_de_promocion_entre_0_y_1(monkeypatch):
+    monkeypatch.setenv("CHURN_PROMOTION_MARGIN", "0.02")
+    assert Settings(_env_file=None).promotion_margin == 0.02
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, promotion_margin=-0.01)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, promotion_margin=1.5)

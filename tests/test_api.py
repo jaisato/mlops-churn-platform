@@ -300,8 +300,10 @@ def test_model_versions_lista_las_publicadas(client_factory, train_small):
         "complete": True,
         "trained_at": body["versions"][1]["trained_at"],
         "roc_auc": body["versions"][1]["roc_auc"],
+        "promotion": "promoted",
     }
     assert body["versions"][1]["roc_auc"] > 0.5
+    assert body["versions"][0]["promotion"] == "no_champion"  # la primera no tenia rival
 
 
 def test_model_versions_sin_modelo(client_sin_modelo):

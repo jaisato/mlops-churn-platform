@@ -35,6 +35,10 @@ class Settings(BaseSettings):
 
     # Gate de calidad: el entrenamiento NO publica artefactos si el AUC queda por debajo
     min_roc_auc: float = Field(default=0.75, ge=0.5, le=1.0)
+    # Campeon/retador: el modelo nuevo solo pasa a `current` si su AUC sobre el holdout de
+    # los datos nuevos es >= AUC del modelo en servicio - margen. 0 = al menos igual de
+    # bueno; 1 = promover siempre que supere el gate (desactiva la comparacion).
+    promotion_margin: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # Si es True, la API rechaza cargar un modelo entrenado con otra version menor de
     # scikit-learn (los pickles no son portables); las features incompatibles se rechazan siempre

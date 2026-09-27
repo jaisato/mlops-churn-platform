@@ -2,9 +2,13 @@ import contextlib
 
 import pytest
 from fastapi.testclient import TestClient
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 
 from churn.config import Settings
-from churn.data.generator import generate_dataset
+from churn.data.generator import CATEGORICAL_FEATURES, NUMERIC_FEATURES, generate_dataset
 from churn.serving.main import create_app
 from churn.training.train import train
 
@@ -27,6 +31,20 @@ def make_settings(model_dir: str, **overrides) -> Settings:
     )
     base.update(overrides)
     return Settings(_env_file=None, **base)
+
+
+def weak_pipeline(seed: int = 42) -> Pipeline:
+    """Sustituto de `build_pipeline`: un unico stump. Pasa un gate laxo (`min_roc_auc=0.5`)
+    pero pierde con claridad frente a un campeon normal: sirve para forzar la decision
+    "rejected" de la promocion de forma determinista."""
+    preprocessor = ColumnTransformer(
+        [
+            ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_FEATURES),
+            ("num", "passthrough", NUMERIC_FEATURES),
+        ]
+    )
+    model = HistGradientBoostingClassifier(max_iter=1, max_depth=1, random_state=seed)
+    return Pipeline([("preprocess", preprocessor), ("model", model)])
 
 
 @pytest.fixture(scope="session")
@@ -54,11 +72,17 @@ def client_sin_modelo(tmp_path):
 
 @pytest.fixture()
 def train_small():
-    """Entrena un modelo pequeno (rapido) en el directorio indicado y devuelve su metadata."""
+    """Entrena un modelo pequeno (rapido) en el directorio indicado y devuelve su metadata.
 
-    def _train(model_dir, seed: int = 21) -> dict:
+    Publica SIEMPRE (`promotion_margin=1.0` desactiva la comparacion con el campeon): con
+    1200 filas el AUC del holdout es ruidoso y estos tests ejercitan el almacen y la API,
+    no la promocion. La promocion tiene sus propios tests en `test_retraining.py`.
+    """
+
+    def _train(model_dir, seed: int = 21, **overrides) -> dict:
         df = generate_dataset(n_rows=SMALL_ROWS, seed=seed)
-        return train(df, model_dir=str(model_dir), seed=seed)
+        options = {"promotion_margin": 1.0, **overrides}
+        return train(df, model_dir=str(model_dir), seed=seed, **options)
 
     return _train
 
