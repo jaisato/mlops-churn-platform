@@ -86,7 +86,7 @@ Sin Docker: `make install && make run` (entrena y sirve en local; requiere Pytho
 |---|---|---|
 | `CHURN_ENVIRONMENT` | `dev` | En `production` la API se niega a arrancar con un token de administración inseguro |
 | `CHURN_MODEL_DIR` | `models` | Directorio de artefactos (volumen compartido) |
-| `CHURN_MODEL_KEEP_VERSIONS` | `5` | Versiones publicadas que se conservan (la actual nunca se borra) |
+| `CHURN_MODEL_KEEP_VERSIONS` | `5` | Versiones publicadas que se conservan (la actual nunca se borra; los retadores rechazados no desalojan a los campeones anteriores) |
 | `CHURN_STRICT_ARTIFACT_COMPAT` | `true` | Rechazar modelos serializados con otra versión menor de scikit-learn |
 | `CHURN_MLFLOW_TRACKING_URI` | *(vacío = desactivado)* | URL de MLflow para tracking/registry |
 | `CHURN_MLFLOW_CHAMPION_ALIAS` | `champion` | Alias asignado en el registry a cada versión que supera el gate (`""` = ninguno) |
@@ -114,7 +114,7 @@ Sin Docker: `make install && make run` (entrena y sirve en local; requiere Pytho
 | `GET` | `/model/info` | Versión, métricas, gate, **decisión de promoción** (AUC del campeón y del retador), **origen y huella de los datos**, semilla, runtime, `run_id` y versión de MLflow |
 | `GET` | `/model/versions` | Versiones publicadas en el almacén (con su decisión `promoted`/`rejected`/`no_champion`), cuál apunta `current` y cuál sirve este proceso |
 | `POST` | `/model/reload` | Carga la versión `current` (cabecera `X-Admin-Token`); conserva la anterior si falla |
-| `POST` | `/model/rollback` | Vuelve a la versión anterior o a `{"version": "..."}`; mueve `current` solo si carga bien |
+| `POST` | `/model/rollback` | Vuelve a la versión anterior que llegó a servirse (se salta los retadores rechazados) o a `{"version": "..."}`; mueve `current` solo si carga bien |
 | `GET` | `/monitoring/drift` | Informe de drift; 409 mientras no haya `CHURN_DRIFT_MIN_ROWS` predicciones |
 
 Tras un reload o rollback, el drift de predicciones solo compara puntuaciones producidas por la **versión en servicio**; las features del tráfico anterior siguen contando. Cada respuesta lleva `X-Request-ID` (propagado si el cliente lo envía) y el mismo identificador aparece en la línea JSON del log de acceso.
