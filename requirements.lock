@@ -41,7 +41,7 @@ databricks-sdk==0.140.0
     # via mlflow-skinny
 docker==7.2.0
     # via mlflow
-fastapi==0.141.1
+fastapi==0.142.2
     # via
     #   -r requirements.txt
     #   mlflow-skinny
@@ -127,6 +127,7 @@ numpy==2.5.3 ; python_full_version >= '3.12'
     #   scipy
 opentelemetry-api==1.44.0
     # via
+    #   fastapi
     #   mlflow-skinny
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
@@ -248,7 +249,7 @@ urllib3==2.8.0
     #   databricks-sdk
     #   docker
     #   requests
-uvicorn==0.53.0
+uvicorn==0.54.0
     # via
     #   -r requirements.txt
     #   mlflow-skinny
