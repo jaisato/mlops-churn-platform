@@ -62,7 +62,7 @@ defusedxml==0.7.1
     # via py-serializable
 docker==7.2.0
     # via mlflow
-fastapi==0.141.1
+fastapi==0.142.2
     # via
     #   -r requirements.txt
     #   mlflow-skinny
@@ -100,7 +100,7 @@ httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
     # via -r requirements-dev.txt
-hypothesis==6.168.2
+hypothesis==6.168.3
     # via -r requirements-dev.txt
 idna==3.20
     # via
@@ -186,6 +186,7 @@ numpy==2.5.3 ; python_full_version >= '3.12'
     #   scipy
 opentelemetry-api==1.44.0
     # via
+    #   fastapi
     #   mlflow-skinny
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
@@ -300,7 +301,7 @@ rich==15.0.0
     # via
     #   pip-audit
     #   textual
-ruff==0.16.8
+ruff==0.16.10
     # via -r requirements-dev.txt
 scikit-learn==1.9.1
     # via
@@ -374,7 +375,7 @@ urllib3==2.8.0
     #   databricks-sdk
     #   docker
     #   requests
-uvicorn==0.53.0
+uvicorn==0.54.0
     # via
     #   -r requirements.txt
     #   mlflow-skinny
