@@ -1,5 +1,6 @@
 import json
 import logging
+import sys
 
 import pytest
 
@@ -100,6 +101,14 @@ def test_configure_logging_instala_un_unico_handler_json(root_logger_restaurado)
     configure_logging("WARNING")  # idempotente: no acumula handlers
     assert len(root.handlers) == 1
     assert root.level == logging.WARNING
+
+
+def test_configure_logging_escribe_en_stdout_salvo_que_se_pida_otro_flujo(root_logger_restaurado):
+    configure_logging("INFO")
+    assert root_logger_restaurado.handlers[0].stream is sys.stdout
+    configure_logging("INFO", stream=sys.stderr)  # CLIs que reservan stdout para su resultado
+    assert root_logger_restaurado.handlers[0].stream is sys.stderr
+    assert isinstance(root_logger_restaurado.handlers[0].formatter, JsonFormatter)
 
 
 def test_configure_logging_redirige_uvicorn_al_formato_json(root_logger_restaurado):

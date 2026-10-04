@@ -14,6 +14,7 @@ def test_valores_por_defecto():
     assert (s.drift_min_rows, s.drift_buffer_size, s.psi_alert_threshold) == (200, 5000, 0.2)
     assert s.min_roc_auc == 0.75
     assert s.promotion_margin == 0.0
+    assert (s.prediction_keep_rows, s.labels_min_rows) == (100_000, 500)
     assert s.is_production is False
 
 
@@ -53,6 +54,19 @@ def test_drift_min_rows_no_puede_superar_el_buffer():
 def test_drift_min_rows_minimo_2():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, drift_min_rows=1)
+
+
+def test_la_retencion_de_predicciones_cubre_la_ventana_de_drift(monkeypatch):
+    with pytest.raises(ValidationError, match="prediction_keep_rows"):
+        Settings(_env_file=None, drift_buffer_size=5000, prediction_keep_rows=4999)
+    s = Settings(_env_file=None, drift_buffer_size=5000, prediction_keep_rows=5000)
+    assert s.prediction_keep_rows == 5000
+    monkeypatch.setenv("CHURN_PREDICTION_KEEP_ROWS", "250000")
+    monkeypatch.setenv("CHURN_LABELS_MIN_ROWS", "800")
+    s = Settings(_env_file=None)
+    assert (s.prediction_keep_rows, s.labels_min_rows) == (250_000, 800)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, labels_min_rows=0)
 
 
 @pytest.mark.parametrize("env", ["production", "prod", "PRODUCTION"])

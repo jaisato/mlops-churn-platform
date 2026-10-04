@@ -48,7 +48,9 @@ class Settings(BaseSettings):
     risk_medium: float = Field(default=0.35, ge=0.0, le=1.0)
     risk_high: float = Field(default=0.65, ge=0.0, le=1.0)
 
-    # Monitorizacion de drift
+    # Monitorizacion de drift y de rendimiento real: ambas exigen drift_min_rows observaciones
+    # (predicciones recientes para el drift, predicciones etiquetadas para el rendimiento) y
+    # miran como mucho las drift_buffer_size mas recientes
     drift_min_rows: int = Field(default=200, ge=2)
     drift_buffer_size: int = Field(default=5000, ge=2)
     psi_alert_threshold: float = Field(default=0.2, gt=0.0)
@@ -56,6 +58,13 @@ class Settings(BaseSettings):
     # procesos; fichero drift_db_path o <model_dir>/drift.sqlite) o "memory" (por proceso)
     drift_store: Literal["sqlite", "memory"] = "sqlite"
     drift_db_path: str = ""
+    # Predicciones que se conservan en el almacen para poder etiquetarlas (POST /labels): la
+    # etiqueta real llega semanas despues de puntuar, asi que la retencion es mucho mayor que
+    # la ventana de drift. Una prediccion desalojada ya no se puede etiquetar.
+    prediction_keep_rows: int = Field(default=100_000, ge=2)
+    # Minimo de predicciones etiquetadas para construir el dataset de reentreno
+    # (`python -m churn.data.labels`); el validador de entrenamiento exige ademas >= 500 filas
+    labels_min_rows: int = Field(default=500, ge=1)
 
     # Token para operaciones administrativas (/model/reload, /model/rollback)
     admin_token: str = "cambia-este-token"
@@ -81,6 +90,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"drift_min_rows ({self.drift_min_rows}) no puede superar "
                 f"drift_buffer_size ({self.drift_buffer_size}): el drift nunca se calcularia"
+            )
+        if self.prediction_keep_rows < self.drift_buffer_size:
+            raise ValueError(
+                f"prediction_keep_rows ({self.prediction_keep_rows}) debe ser al menos "
+                f"drift_buffer_size ({self.drift_buffer_size}): la ventana de drift se lee "
+                "del mismo almacen"
             )
         if self.is_production and not self.admin_token_is_secure:
             raise ValueError(
