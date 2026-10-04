@@ -34,6 +34,7 @@ services:
     environment:
       CHURN_MLFLOW_TRACKING_URI: http://mlflow:5000
       CHURN_PROMOTION_MARGIN: ${CHURN_PROMOTION_MARGIN:-0}
+      CHURN_LABELS_MIN_ROWS: ${CHURN_LABELS_MIN_ROWS:-500}   # `make retrain` sin DATA= lo respeta
     volumes:
       - models:/models
     depends_on:
