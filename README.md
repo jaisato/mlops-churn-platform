@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jaisato/mlops-churn-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/jaisato/mlops-churn-platform/actions/workflows/ci.yml)
 
-Plataforma **MLOps end-to-end** para predicción de bajas de clientes (*churn*): generación/validación de datos, entrenamiento reproducible desde datos etiquetados (CSV/Parquet) o sintéticos con **gate de calidad** y **promoción campeón/retador** que protegen el modelo en servicio, **almacén de modelos versionado con rollback**, registro en **MLflow** con alias de campeón, serving en tiempo real con **FastAPI**, **monitorización de drift** persistente (PSI + Kolmogorov-Smirnov sobre las features y PSI sobre las predicciones) y **métricas Prometheus**.
+Plataforma **MLOps end-to-end** para predicción de bajas de clientes (*churn*): generación/validación de datos, entrenamiento reproducible desde datos etiquetados (CSV/Parquet) o sintéticos con **gate de calidad** y **promoción campeón/retador** que protegen el modelo en servicio, **almacén de modelos versionado con rollback**, registro en **MLflow** con alias de campeón, serving en tiempo real con **FastAPI**, **monitorización de drift** persistente (PSI + Kolmogorov-Smirnov sobre las features y PSI sobre las predicciones), **bucle de etiquetas cerrado** (el churn real vuelve a la plataforma, mide el acierto del modelo en producción y alimenta el reentreno automático) y **métricas Prometheus**.
 
 > **Por qué este proyecto**: *ML Engineer* es el perfil IA con más ofertas activas en España y *MLOps* tiene más vacantes que candidatos (salarios senior 78-100 k€). Lo que piden esas ofertas es exactamente esto: llevar un modelo del prototipo a producción con ciclo de vida completo (entrenar → registrar → servir → monitorizar → reentrenar → volver atrás si hace falta).
 
@@ -17,9 +17,10 @@ Plataforma **MLOps end-to-end** para predicción de bajas de clientes (*churn*):
 5. **Publica cada modelo como una versión inmutable** en `models/versions/<versión>/` (`model.joblib` + `metadata.json` + `reference.csv` — la referencia de drift sale de los datos con los que se entrenó **esa** versión) y mueve el puntero `models/current` de forma atómica. Las versiones antiguas se podan (`CHURN_MODEL_KEEP_VERSIONS`), nunca la que está en servicio.
 6. **Registra** parámetros, métricas, decisión de promoción y modelo en **MLflow Model Registry** (opcional) y asigna el alias **`champion`** a cada versión promovida. Si MLflow no responde, el entrenamiento avisa y termina igualmente: el tracking es trazabilidad, no un punto único de fallo. El `run_id` y la versión del registry quedan en `metadata.json` y en `/model/info`.
 7. **Comprueba la compatibilidad antes de servir**: el metadata guarda las versiones de Python y scikit-learn con las que se serializó el pipeline; la API rechaza modelos con otras features o con otra versión menor de scikit-learn (los pickles no son portables) en lugar de servirlos a ciegas.
-8. **Sirve** predicciones vía API REST (individual y batch) con niveles de riesgo de negocio (`bajo/medio/alto`), API key opcional, `X-Request-ID` y logs JSON.
+8. **Sirve** predicciones vía API REST (individual y batch) con niveles de riesgo de negocio (`bajo/medio/alto`) y un **`prediction_id`** por predicción, API key opcional, `X-Request-ID` y logs JSON.
 9. **Monitoriza drift** con las predicciones guardadas en **SQLite dentro del volumen** (sobreviven a reinicios y se comparten entre workers): PSI y KS por variable contra la referencia de entrenamiento y PSI de las **predicciones** contra las puntuaciones de la referencia, expuesto también como métricas Prometheus.
-10. **Reentrena, recarga y vuelve atrás sin parar el servicio**: `retrain-if-drift.sh` consulta el drift y, si lo hay, reentrena con **datos etiquetados nuevos** (`CHURN_TRAIN_DATA`), promueve solo si el retador gana y entonces hace `POST /model/reload`; `POST /model/rollback` devuelve la versión anterior (o una concreta). Un reload o rollback fallido **nunca degrada el servicio**: se conserva el último modelo bueno.
+10. **Cierra el bucle de etiquetas**: cuando el negocio conoce el churn real de un cliente puntuado lo devuelve con `POST /labels` (`prediction_id` + `churn`, idempotente, autenticado con el token de administración). La etiqueta se guarda **junto a la predicción** (features, probabilidad y versión que la produjo), `GET /monitoring/performance` mide el **acierto real** del modelo (AUC, precision, recall, F1, Brier) en conjunto y por versión, y `python -m churn.data.labels` convierte el historial etiquetado en un dataset de reentreno con **huella SHA-256 y ventana temporal** que acaban en el metadata del modelo entrenado con él.
+11. **Reentrena, recarga y vuelve atrás sin parar el servicio**: `retrain-if-drift.sh` consulta el drift y, si lo hay, construye el dataset con las etiquetas recibidas (o usa `CHURN_TRAIN_DATA` si el operador aporta un fichero), reentrena, promueve solo si el retador gana y entonces hace `POST /model/reload`; `POST /model/rollback` devuelve la versión anterior (o una concreta). Un reload o rollback fallido **nunca degrada el servicio**: se conserva el último modelo bueno.
 
 ## 🏗️ Arquitectura
 
@@ -28,15 +29,17 @@ Plataforma **MLOps end-to-end** para predicción de bajas de clientes (*churn*):
   o sintéticos (--drift-shift)     gate calidad       current ─▶ versions/<v>/model.joblib
  ┌──────────────┐  campeón vs retador ┌────────────────────┐                     metadata.json
  │   trainer     │──promueve si gana─▶│  LocalModelStore   │                     reference.csv
- │ (mismo image) │──log runs──┐       │ (versionado+atómico)  drift.sqlite (predicciones recientes)
- └──────────────┘             ▼       └────────────────────┘
-                        ┌──────────┐        ▲ carga al arrancar / reload / rollback
-                        │  MLflow  │  ┌─────┴─────┐   /predict /predict/batch  /model/info
-  clientes ────────────▶│ registry │  │ API FastAPI│──▶ /model/versions /model/rollback
-                        │ @champion│  └───────────┘   /monitoring/drift  /metrics  /health/live
-                        └──────────┘        │ features + probabilidad por predicción
-                                            ▼
-                              drift PSI + KS (features) y PSI (predicciones)
+ │ (mismo image) │──log runs──┐       │ (versionado+atómico)  drift.sqlite (predicciones + etiquetas)
+ └──────────────┘             ▼       └────────────────────┘  datasets/labels.parquet (+ .meta.json)
+        ▲ --data        ┌──────────┐        ▲ carga al arrancar / reload / rollback
+        │               │  MLflow  │  ┌─────┴─────┐   /predict /predict/batch ◀── clientes
+  python -m             │ registry │  │ API FastAPI│──▶ /model/info /model/versions /model/rollback
+  churn.data.labels     │ @champion│  └─────┬─────┘   /monitoring/drift  /monitoring/performance
+  (etiquetas ─▶ dataset)└──────────┘        │          /metrics  /health/live
+        ▲                                   ▼ features + probabilidad + prediction_id
+  drift.sqlite ◀──────── POST /labels: churn real por prediction_id (negocio / CRM)
+                            drift PSI + KS (features) y PSI (predicciones)
+                            rendimiento real: AUC / precision / recall por versión
 ```
 
 ## 🚀 Arranque local con Docker
@@ -60,7 +63,17 @@ curl -X POST http://localhost:8010/predict -H 'Content-Type: application/json' -
   "num_products": 1, "support_tickets_90d": 6, "is_fiber": 0,
   "contract_type": "mensual", "payment_method": "transferencia"
 }'
-# → {"churn_probability": 0.87, "risk_level": "alto", "model_version": "20260920-101500-3f9a1c"}
+# → {"prediction_id": "3f2a…", "churn_probability": 0.87, "risk_level": "alto", "model_version": "20260920-101500-3f9a1c"}
+```
+
+Semanas después, cuando se sabe si ese cliente se dio de baja, el negocio cierra el bucle:
+
+```bash
+curl -X POST http://localhost:8010/labels -H 'X-Admin-Token: token-local' -H 'Content-Type: application/json' \
+  -d '{"labels": [{"prediction_id": "3f2a…", "churn": 1, "observed_at": "2026-10-20T09:00:00Z"}]}'
+# → {"received": 1, "created": 1, "updated": 0, "unknown": [], "labelled_total": 1}
+make performance   # AUC / precision / recall reales sobre las predicciones etiquetadas, por versión
+make retrain       # construye /models/datasets/labels.parquet con esas etiquetas, reentrena y recarga si gana
 ```
 
 Ciclo completo drift → reentreno → recuperación, ensayable sin datos reales:
@@ -76,9 +89,9 @@ curl -X POST localhost:8010/model/rollback -H 'X-Admin-Token: token-local'   # v
 curl localhost:8010/model/versions       # qué hay publicado y qué decisión de promoción tuvo cada versión
 ```
 
-`make retrain` sin `DATA=` reentrena con el generador sintético de siempre: **produce el mismo modelo** (misma huella de datos) y el trainer lo avisa; solo sirve como demo de reload. Si el retador no gana, el trainer termina con código 3, la API no se recarga y la versión queda en `/model/versions` como `rejected`.
+`make retrain` sin `DATA=` reentrena con las **etiquetas recibidas por la API**: construye el dataset dentro del volumen (`python -m churn.data.labels`, código 3 y sin reentreno si hay menos de `CHURN_LABELS_MIN_ROWS`) y entrena con `--data`. Si el retador no gana, el trainer termina con código 3, la API no se recarga y la versión queda en `/model/versions` como `rejected`.
 
-Sin Docker: `make install && make run` (entrena y sirve en local; requiere Python 3.11+); `make train DATA=fichero.parquet` entrena desde un fichero.
+Sin Docker: `make install && make run` (entrena y sirve en local; requiere Python 3.11+); `make train DATA=fichero.parquet` entrena desde un fichero y `make labels-dataset` escribe `data/labels.parquet` (más `data/labels.parquet.meta.json`, el *sidecar* con filas, ventana temporal y huella) con las etiquetas recibidas por la API local, listo para `make train DATA=data/labels.parquet`.
 
 ## ⚙️ Configuración
 
@@ -92,14 +105,16 @@ Sin Docker: `make install && make run` (entrena y sirve en local; requiere Pytho
 | `CHURN_MLFLOW_CHAMPION_ALIAS` | `champion` | Alias asignado en el registry a cada versión que supera el gate (`""` = ninguno) |
 | `CHURN_MIN_ROC_AUC` | `0.75` | Gate de calidad: AUC mínimo para publicar artefactos (también `--min-auc` en el trainer) |
 | `CHURN_PROMOTION_MARGIN` | `0` | Campeón/retador: el modelo nuevo pasa a `current` si `AUC_nuevo >= AUC_actual - margen` sobre el holdout de los datos nuevos (`1` = promover siempre que pase el gate; también `--promotion-margin`) |
-| `CHURN_TRAIN_DATA` | *(vacío)* | Solo `retrain-if-drift.sh`: ruta en el host al `.csv`/`.parquet` **etiquetado** con el que reentrenar. Sin ella el script avisa y no reentrena |
+| `CHURN_TRAIN_DATA` | *(vacío)* | Solo `retrain-if-drift.sh`: ruta en el host a un `.csv`/`.parquet` **etiquetado** propio (export del CRM). Sin ella el script reentrena con las etiquetas recibidas por `POST /labels` |
+| `CHURN_LABELS_MIN_ROWS` | `500` | Mínimo de predicciones etiquetadas para construir el dataset de reentreno (`python -m churn.data.labels --min-rows`); por debajo, el script avisa y no reentrena |
+| `CHURN_PREDICTION_KEEP_ROWS` | `100000` | Predicciones que conserva el almacén para poder etiquetarlas (la etiqueta llega semanas después; una predicción desalojada ya no se puede etiquetar). Las ya etiquetadas se conservan aparte, sin límite |
 | `CHURN_RISK_MEDIUM` / `CHURN_RISK_HIGH` | `0.35` / `0.65` | Umbrales de riesgo de negocio (inclusivos; `medium < high` obligatorio) |
-| `CHURN_DRIFT_MIN_ROWS` | `200` | Mínimo de predicciones para calcular drift |
-| `CHURN_DRIFT_BUFFER_SIZE` | `5000` | Ventana rodante de predicciones recientes |
-| `CHURN_DRIFT_STORE` / `CHURN_DRIFT_DB_PATH` | `sqlite` / `<model_dir>/drift.sqlite` | Dónde viven las predicciones (`memory` = por proceso, solo demos) |
+| `CHURN_DRIFT_MIN_ROWS` | `200` | Mínimo de predicciones (drift) o de predicciones etiquetadas (rendimiento) para calcular el informe |
+| `CHURN_DRIFT_BUFFER_SIZE` | `5000` | Ventana reciente que miran `/monitoring/drift` y `/monitoring/performance` |
+| `CHURN_DRIFT_STORE` / `CHURN_DRIFT_DB_PATH` | `sqlite` / `<model_dir>/drift.sqlite` | Dónde viven las predicciones y sus etiquetas (`memory` = por proceso, solo demos) |
 | `CHURN_PSI_ALERT_THRESHOLD` | `0.2` | Umbral de alerta PSI |
-| `CHURN_ADMIN_TOKEN` | — | Token de `/model/reload` y `/model/rollback` (>= 16 caracteres en producción; `openssl rand -hex 32`) |
-| `CHURN_API_KEY` | *(vacío = abierto)* | Si se define, `/predict*`, `/model/info`, `/model/versions` y `/monitoring/drift` exigen `X-API-Key` |
+| `CHURN_ADMIN_TOKEN` | — | Token de `/model/reload`, `/model/rollback` y `/labels` (>= 16 caracteres en producción; `openssl rand -hex 32`) |
+| `CHURN_API_KEY` | *(vacío = abierto)* | Si se define, `/predict*`, `/model/info`, `/model/versions` y `/monitoring/*` exigen `X-API-Key` |
 | `CHURN_METRICS_ENABLED` / `CHURN_ACCESS_LOG` | `true` / `true` | `/metrics` Prometheus y una línea JSON por petición |
 
 ## 📡 API
@@ -108,16 +123,27 @@ Sin Docker: `make install && make run` (entrena y sirve en local; requiere Pytho
 |---|---|---|
 | `GET` | `/health/live` | Liveness: el proceso responde (siempre 200) |
 | `GET` | `/health` | Readiness: 200 con la versión del modelo cargado; 503 si no hay modelo |
-| `GET` | `/metrics` | Métricas Prometheus: peticiones y latencia por ruta, predicciones por riesgo y versión, histograma de probabilidades, PSI del último informe, versión en servicio |
-| `POST` | `/predict` | Probabilidad de churn + nivel de riesgo para un cliente |
+| `GET` | `/metrics` | Métricas Prometheus: peticiones y latencia por ruta, predicciones por riesgo y versión, histograma de probabilidades, PSI del último informe, versión en servicio, etiquetas recibidas por resultado (`churn_labels_total`), etiquetadas disponibles (`churn_labels_stored`) y rendimiento real por versión (`churn_performance_*`) |
+| `POST` | `/predict` | Probabilidad de churn + nivel de riesgo para un cliente, con el `prediction_id` que identifica la predicción para etiquetarla después |
 | `POST` | `/predict/batch` | Lo mismo para 1-1000 clientes |
-| `GET` | `/model/info` | Versión, métricas, gate, **decisión de promoción** (AUC del campeón y del retador), **origen y huella de los datos**, semilla, runtime, `run_id` y versión de MLflow |
+| `POST` | `/labels` | Churn real de 1-1000 predicciones ya servidas: `[{"prediction_id", "churn": 0\|1, "observed_at"?}]` (cabecera `X-Admin-Token`). **Idempotente por `prediction_id`**: la última etiqueta recibida es la que vale, reenviar un lote no duplica nada; los ids desconocidos (o ya desalojados del almacén) vuelven en `unknown` sin invalidar el resto; `observed_at` ausente = instante de recepción. Un lote con ids repetidos es un 422 |
+| `GET` | `/monitoring/performance` | Acierto real sobre las predicciones etiquetadas más recientes (`CHURN_DRIFT_BUFFER_SIZE`): AUC, accuracy, precision, recall, F1 y Brier con umbral 0.5 (el mismo que el holdout del entrenamiento), en conjunto y **por versión del modelo**, más el AUC de holdout de la versión en servicio para comparar; 409 mientras no haya `CHURN_DRIFT_MIN_ROWS` etiquetadas. No exige modelo cargado |
+| `GET` | `/model/info` | Versión, métricas, gate, **decisión de promoción** (AUC del campeón y del retador), **origen y huella de los datos** (y, si salen de las etiquetas, su ventana temporal y las versiones que puntuaron), semilla, runtime, `run_id` y versión de MLflow |
 | `GET` | `/model/versions` | Versiones publicadas en el almacén (con su decisión `promoted`/`rejected`/`no_champion`), cuál apunta `current` y cuál sirve este proceso |
 | `POST` | `/model/reload` | Carga la versión `current` (cabecera `X-Admin-Token`); conserva la anterior si falla |
 | `POST` | `/model/rollback` | Vuelve a la versión anterior que llegó a servirse (se salta los retadores rechazados) o a `{"version": "..."}`; mueve `current` solo si carga bien |
 | `GET` | `/monitoring/drift` | Informe de drift; 409 mientras no haya `CHURN_DRIFT_MIN_ROWS` predicciones |
 
-Tras un reload o rollback, el drift de predicciones solo compara puntuaciones producidas por la **versión en servicio**; las features del tráfico anterior siguen contando. Cada respuesta lleva `X-Request-ID` (propagado si el cliente lo envía) y el mismo identificador aparece en la línea JSON del log de acceso.
+Tras un reload o rollback, el drift de predicciones solo compara puntuaciones producidas por la **versión en servicio**; las features del tráfico anterior siguen contando. El rendimiento real, en cambio, se desglosa por versión: la etiqueta llega semanas después de puntuar, así que una ventana suele mezclar la versión en servicio con la anterior. Cada respuesta lleva `X-Request-ID` (propagado si el cliente lo envía) y el mismo identificador aparece en la línea JSON del log de acceso.
+
+### Dataset de reentreno a partir de las etiquetas
+
+```bash
+python -m churn.data.labels --model-dir /models                      # → /models/datasets/labels.parquet (+ .meta.json)
+python -m churn.data.labels --db models/drift.sqlite --out data/labels.csv --min-rows 800
+```
+
+Une cada etiqueta con las features y la probabilidad de su predicción y escribe un `.csv`/`.parquet` con **exactamente las columnas del contrato de entrenamiento** (en orden de predicción), validado con las mismas reglas que el trainer. Junto al fichero deja el *sidecar* `<fichero>.meta.json` (filas, tasa de churn, rango de fechas de predicción y de observación, versiones que puntuaron, huella SHA-256); cuando el trainer carga ese fichero con `--data` y la huella coincide, el metadata del modelo registra `data_source.kind = "labels"` con esa ventana. Imprime un resumen JSON por stdout (los logs van a stderr) y termina con `0` (escrito), `3` (menos de `--min-rows`/`CHURN_LABELS_MIN_ROWS` etiquetas) o `2` (almacén inexistente o dataset inválido).
 
 ## ✅ Tests automatizados
 
@@ -126,7 +152,7 @@ make install && make test       # suite completa (~25 s, sin servicios externos)
 make check                      # lo mismo que el CI: ruff, mypy y cobertura (umbral 90 %)
 ```
 
-Qué cubren (281 tests en 15 módulos, cobertura de líneas y ramas del 100 %):
+Qué cubren (375 tests en 18 módulos, cobertura de líneas y ramas del 100 %):
 
 - **Generador**: esquema, reproducibilidad, señal predictiva, dtypes, contrato con los rangos del validador y **drift determinista** (`DriftSpec`: sin especificación el dataset es bit a bit el de siempre; con ella las features superan el umbral PSI, la relación con la etiqueta cambia y todo sigue dentro del contrato).
 - **Fuentes de datos**: CSV y Parquet, extensión desconocida, fichero ausente, vacío o corrupto, Parquet sin motor, huella SHA-256 estable y sensible al contenido.
@@ -134,12 +160,15 @@ Qué cubren (281 tests en 15 módulos, cobertura de líneas y ramas del 100 %):
 - **Entrenamiento**: artefactos versionados, gate de calidad que no sobreescribe, metadata de trazabilidad con runtime, origen de datos y promoción, versiones únicas, MLflow desactivado / no instalado / caído / correcto / alias fallido / **retador rechazado sin alias** (con dobles, sin servidor) y CLI (`--data`, `--drift-shift`) con códigos de salida 0/2/3.
 - **Reentrenamiento real** (`test_retraining.py`): reentrenar con el mismo generador y semilla produce un modelo idéntico y **el drift no cambia**; reentrenar con datos del mundo nuevo produce otro modelo, gana al campeón y **el drift desaparece**; retador peor guardado sin promover, margen, campeón ilegible o con otras features, y la API sigue sirviendo al campeón tras un reload.
 - **Almacén de modelos**: publicación atómica, retención, layout plano heredado, rollback en ambas direcciones, versiones incompletas o corruptas, compatibilidad de features y runtime.
-- **Almacén de predicciones**: memoria y SQLite con el mismo contrato, ventana rodante, persistencia entre instancias, escrituras concurrentes.
+- **Almacén de predicciones y etiquetas**: memoria y SQLite con el mismo contrato, `prediction_id` único, ventana rodante, persistencia entre instancias, escrituras y etiquetado concurrentes, etiquetas que crean/corrigen/reportan desconocidos, normalización de `observed_at` a UTC, etiquetas que sobreviven al desalojo de la ventana, orden de predicción y límite, migración de un `drift.sqlite` anterior al bucle.
+- **Dataset de etiquetas** (`test_labels.py`): columnas del contrato en orden de predicción, ventana temporal y versiones, CSV/Parquet con *sidecar* cuya huella es la que calcula el trainer, mínimos (insuficiente, por debajo del validador), dataset inválido, formato no soportado y CLI (defectos de `settings`, `--db/--out/--min-rows`, almacén inexistente, códigos 0/2/3 y resumen JSON solo en stdout).
+- **Rendimiento real** (`test_performance.py`): métricas con ambas clases y con una sola (AUC indefinido), umbral, informe global y por versión.
+- **Bucle completo** (`test_label_loop.py`): la API puntúa un mundo desplazado, el negocio devuelve el churn real, el acierto real cae por debajo del holdout, la CLI construye el dataset desde el mismo SQLite, el trainer entrena con `--data`, gana al campeón, el metadata registra la procedencia de las etiquetas y, tras el reload, el modelo nuevo acierta más y el drift desaparece.
 - **Drift**: PSI en binarias desbalanceadas, referencias constantes, baja cardinalidad, nulos, categóricas con tipos mezclados, *prediction drift*, estructura del informe y **propiedades con Hypothesis** (no negatividad, simetría, cobertura de los bins).
 - **Configuración**: prefijo `CHURN_`, umbrales coherentes, guardia de token en producción.
-- **API**: coherencia de riesgo, validación 422, batch consistente con individual, 503 sin modelo, drift 409→200 y detectado, reload y rollback con token, versión nueva, artefactos ausentes, corruptos o incompatibles, retención, API key, métricas, `X-Request-ID` y log de acceso.
+- **API**: coherencia de riesgo, validación 422, batch consistente con individual, 503 sin modelo, drift 409→200 y detectado, reload y rollback con token, versión nueva, artefactos ausentes, corruptos o incompatibles, retención, API key, métricas, `X-Request-ID` y log de acceso; `prediction_id` único, `POST /labels` (token, 422, creación/corrección/desconocidos, idempotencia, `observed_at` por defecto, sin modelo, persistencia entre reinicios) y `/monitoring/performance` (409→200, por versión tras un reload, sin modelo cargado, ventana acotada, una sola clase, métricas Prometheus).
 - **Contratos**: el esquema Pydantic de la API coincide con los rangos y categorías del validador.
-- **Scripts**: `generate_data.py` desde cualquier directorio y con `--drift-shift`; `retrain-if-drift.sh` con dobles de `curl` y `docker`: sin drift, 409, API caída, **drift sin `CHURN_TRAIN_DATA` (falla con claridad, no reentrena)**, fichero inexistente, montaje del fichero y `--data`, retador no promovido (sin reload), gate rechazado y avisos por webhook.
+- **Scripts**: `generate_data.py` desde cualquier directorio y con `--drift-shift`; `retrain-if-drift.sh` con dobles de `curl` y `docker`: sin drift, 409, API caída, **drift sin `CHURN_TRAIN_DATA` y con etiquetas suficientes (construye el dataset en el volumen y entrena con él) o insuficientes (avisa, no reentrena)**, dataset de etiquetas inválido o imposible de construir, fichero inexistente, montaje del fichero y `--data`, retador no promovido (sin reload), gate rechazado y avisos por webhook.
 
 `make mutation` ejecuta mutation testing (mutmut) sobre los módulos puros de datos y drift para comprobar que los tests detectan cambios de lógica, no solo que ejecutan líneas.
 
@@ -157,7 +186,7 @@ Guía completa: [`deploy/DESPLIEGUE_NETCUP.md`](deploy/DESPLIEGUE_NETCUP.md). Re
 2. Alta de peers VPN (portátil + runner CI) y login GHCR en el VPS.
 3. Clonar en `/opt/mlops-churn-platform`, `cp .env.example .env` (token seguro y `VPN_BIND_IP` obligatorios), `TAG=latest ./deploy/scripts/deploy.sh`.
 4. Secretos en GitHub (`WG_CONFIG`, `DEPLOY_HOST`, `DEPLOY_HOST_KEY`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`) y desplegar con `git tag v1.2.0 && git push --tags`.
-5. Operación: `deploy/scripts/retrain-if-drift.sh` (cron) reentrena solo si hay drift y `deploy/scripts/backup.sh` (cron) archiva los volúmenes. Rollback de **imagen**: `TAG=$(cat .previous_tag) ./deploy/scripts/deploy.sh`; rollback de **modelo**: `POST /model/rollback`.
+5. Operación: `deploy/scripts/retrain-if-drift.sh` (cron) reentrena solo si hay drift y hay etiquetas suficientes, y `deploy/scripts/backup.sh` (cron) archiva los volúmenes. Rollback de **imagen**: `TAG=$(cat .previous_tag) ./deploy/scripts/deploy.sh`; rollback de **modelo**: `POST /model/rollback`.
 
 Todo el stack de producción, incluido `deploy.sh`, se puede ensayar en local con un registro Docker local (`IMAGE_REGISTRY`, `CADDY_*_PORT` en `.env`); la guía explica cómo.
 
@@ -169,7 +198,10 @@ La API y MLflow solo son accesibles **dentro de la VPN** (Caddy con TLS; MLflow 
 - **Almacén de modelos versionado con puntero atómico**: publicar es renombrar un directorio y sustituir un fichero de texto; volver atrás es mover el puntero. La API no depende de MLflow para arrancar → MLflow es *plus* de trazabilidad, no punto único de fallo, pero el alias `champion` lo convierte en la fuente de "qué modelo está en producción".
 - **Gate de calidad en el pipeline, no solo en los tests**: un reentreno que degrada el AUC no llega nunca al volumen de modelos; el CI además falla si un cambio de código degrada el modelo — el modelo se trata como código.
 - **Campeón/retador sobre el holdout de los datos nuevos**: el gate absoluto no basta (un modelo puede superar 0.75 y aun así ser peor que el que está en servicio). Evaluar ambos en el mismo 20 % de los datos nuevos responde a la pregunta que importa: *¿cuál de los dos funciona mejor en el mundo de hoy?* Si el mundo ha cambiado, el campeón pierde ahí y el retador se promueve; si los datos nuevos no aportan nada, el campeón se queda. El retador rechazado se conserva sin promover: un operador puede ponerlo en servicio con `POST /model/rollback {"version": ...}` si discrepa.
-- **Reentrenar exige datos etiquetados, y la plataforma lo dice**: la API guarda features y probabilidades, no la etiqueta real (llega semanas después, desde el negocio). Antes, `retrain-if-drift.sh` "reentrenaba" con el generador sintético de siempre — mismo dataset, mismo modelo, misma referencia — y el drift seguía exactamente igual; un test (`test_reentrenar_con_el_mismo_generador_no_cambia_nada`) lo deja escrito. Ahora el script exige `CHURN_TRAIN_DATA`, falla con claridad si falta, y la huella SHA-256 del dataset en el metadata delata un reentreno con datos idénticos.
+- **Reentrenar exige datos etiquetados, y la plataforma lo dice**: la etiqueta real llega semanas después, desde el negocio. Antes, `retrain-if-drift.sh` "reentrenaba" con el generador sintético de siempre — mismo dataset, mismo modelo, misma referencia — y el drift seguía exactamente igual; un test (`test_reentrenar_con_el_mismo_generador_no_cambia_nada`) lo deja escrito. Ahora el script reentrena solo con etiquetas reales (las de `POST /labels` o un fichero del operador), avisa con claridad si no hay suficientes, y la huella SHA-256 del dataset en el metadata delata un reentreno con datos idénticos.
+- **El bucle de etiquetas se cierra con el `prediction_id`, no con un id de cliente**: la plataforma no conoce a los clientes, conoce predicciones; el cliente guarda el `prediction_id` junto a su propio identificador y lo devuelve con el churn observado. Así una etiqueta se une sin ambigüedad a las features y a la probabilidad exactas que se sirvieron (y a la versión que las produjo), aunque el mismo cliente se haya puntuado varias veces. Al etiquetar se guarda una **copia del ejemplo** en una tabla aparte: sobrevive al desalojo de la ventana de predicciones y es, literalmente, el dataset de reentreno. La ingesta es **idempotente por `prediction_id`** (reenviar un lote no duplica, corregir sobrescribe) y los ids desconocidos no invalidan el lote, para que un *job* del CRM pueda reintentarse sin cuidado.
+- **El acierto real se mide con las mismas métricas y umbral que el holdout**: `/monitoring/performance` y el entrenamiento comparten `classification_metrics`, así que la cifra de producción y la de `metadata.json` son comparables; el desglose por versión evita atribuir al modelo en servicio los aciertos (o fallos) de la versión anterior.
+- **Procedencia de los datos en el metadata, sin cambiar la interfaz del trainer**: el dataset de etiquetas viaja con un *sidecar* `.meta.json` (filas, ventana, versiones, huella); `--data` sigue siendo un fichero, pero si la huella del sidecar coincide con el fichero cargado, el modelo registra `data_source.kind = "labels"` y su ventana. Si alguien edita el fichero después, la huella no coincide y la procedencia se descarta con un aviso.
 - **Un modelo solo se sirve si este runtime puede cargarlo**: versiones de scikit-learn y features comprobadas antes de servir; el fallo silencioso tras reconstruir la imagen era el riesgo más caro que quedaba.
 - **Un reload o rollback fallido nunca degrada el servicio**: se conserva el último modelo bueno conocido y el error se devuelve al operador.
 - **Drift con PSI/KS implementado y auditable** en lugar de una dependencia pesada, con *binning* robusto para variables binarias/enteras (donde los cuantiles clásicos enmascaran el cambio), *prediction drift* y propiedades verificadas con Hypothesis; migrar a Evidently es trivial si el equipo lo prefiere.
@@ -179,7 +211,7 @@ La API y MLflow solo son accesibles **dentro de la VPN** (Caddy con TLS; MLflow 
 
 ## 🗺️ Posibles extensiones
 
-Reentrenamiento por drift con datos etiquetados y promoción campeón/retador ya cubiertos; queda **cerrar el bucle de etiquetas** (un endpoint o job que reciba el `churn` real de cada cliente puntuado y construya `CHURN_TRAIN_DATA` automáticamente, hoy lo aporta el operador), calibración de probabilidades y ajuste de umbrales con curvas precision-recall, feature store, A/B de modelos (shadow deployment), explicabilidad SHAP por predicción y export a ONNX para latencias < 5 ms.
+Reentrenamiento por drift, promoción campeón/retador y bucle de etiquetas ya cubiertos; quedan la calibración de probabilidades y el ajuste de umbrales con curvas precision-recall (ahora con etiquetas reales sobre las que calcularlas), alertas automáticas por caída del acierto real (hoy `/monitoring/performance` y `churn_performance_*` lo exponen, pero no disparan nada), feature store, A/B de modelos (shadow deployment), explicabilidad SHAP por predicción y export a ONNX para latencias < 5 ms.
 
 ---
 *Proyecto de portfolio orientado a roles **ML Engineer / MLOps Engineer**. Licencia MIT.*

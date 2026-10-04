@@ -113,7 +113,8 @@ Edita `.env`:
 | `VPN_BIND_IP`       | IP del VPS dentro de la VPN (`10.8.0.1`). Obligatoria.                  |
 | `CHURN_API_KEY`     | Opcional. Si se define, scoring, `/model/info`, `/model/versions` y drift exigen `X-API-Key`. |
 | `WEBHOOK_URL`       | Opcional. Webhook (Slack/Mattermost) para los avisos de `retrain-if-drift.sh`. |
-| `CHURN_TRAIN_DATA`  | Ruta en el host a un `.csv`/`.parquet` **etiquetado** (features + columna `churn`) con el que reentrenar. Sin ella `retrain-if-drift.sh` avisa y no reentrena. |
+| `CHURN_TRAIN_DATA`  | Opcional. Ruta en el host a un `.csv`/`.parquet` **etiquetado** propio (features + columna `churn`). Sin ella `retrain-if-drift.sh` reentrena con las etiquetas recibidas por `POST /labels`. |
+| `CHURN_LABELS_MIN_ROWS` | Opcional (`500`). Etiquetas minimas para construir el dataset de reentreno; por debajo el script avisa y no reentrena. |
 | `CHURN_PROMOTION_MARGIN` | Opcional (`0`). Margen de AUC que se le concede al modelo nuevo frente al que esta en servicio. |
 
 Y despliega:
@@ -157,8 +158,11 @@ Configura en *Settings -> Secrets and variables -> Actions*:
 | Rollback de **modelo**  | `curl -X POST localhost:8010/model/rollback -H "X-Admin-Token: $CHURN_ADMIN_TOKEN"` (a la version anterior; `-d '{"version": "..."}'` para una concreta) |
 | Versiones publicadas    | `curl localhost:8010/model/versions`                                    |
 | Version en servicio     | `cat .current_tag` (imagen) y `curl localhost:8010/health` (modelo)     |
-| Reentrenar a mano       | `CHURN_TRAIN_DATA=/ruta/clientes_q3.parquet FORCE=1 deploy/scripts/retrain-if-drift.sh`: monta el fichero en el trainer, entrena con `--data`, compara con el modelo en servicio y recarga la API solo si el nuevo se promueve. Codigos del trainer: 0 promovido, 2 datos invalidos o gate (`CHURN_MIN_ROC_AUC`) no superado, 3 entrenado pero no promovido (el actual sigue en servicio). |
-| Reentrenar por drift    | `deploy/scripts/retrain-if-drift.sh` (cron abajo). Consulta `/monitoring/drift` y, si hay drift, reentrena con `CHURN_TRAIN_DATA`; **sin datos etiquetados nuevos no reentrena** (codigo 3 y aviso): reentrenar con el generador sintetico produciria el mismo modelo. |
+| Etiquetar (churn real)  | `curl -X POST localhost:8010/labels -H "X-Admin-Token: $CHURN_ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"labels": [{"prediction_id": "...", "churn": 1, "observed_at": "2026-10-20T09:00:00Z"}]}'` (hasta 1000 por lote; idempotente: reenviar o corregir no duplica). El `prediction_id` lo devuelve cada respuesta de `/predict`. |
+| Rendimiento real        | `curl -s localhost:8010/monitoring/performance \| python3 -m json.tool`: AUC, precision, recall, F1 y Brier sobre las predicciones etiquetadas recientes, en conjunto y por version; 409 mientras no haya `CHURN_DRIFT_MIN_ROWS` etiquetadas. Tambien como `churn_performance_*` en `/metrics`. |
+| Dataset de etiquetas    | `docker compose -f docker-compose.prod.yml --profile train run --rm --no-deps -T trainer python -m churn.data.labels --model-dir /models`: escribe `/models/datasets/labels.parquet` (+ `.meta.json` con filas, ventana y huella) dentro del volumen y resume en JSON por stdout. Es lo que hace `retrain-if-drift.sh` antes de entrenar. |
+| Reentrenar a mano       | `FORCE=1 deploy/scripts/retrain-if-drift.sh`: construye el dataset con las etiquetas recibidas (o monta `CHURN_TRAIN_DATA=/ruta/clientes_q3.parquet` si se define), entrena con `--data`, compara con el modelo en servicio y recarga la API solo si el nuevo se promueve. Codigos del trainer: 0 promovido, 2 datos invalidos o gate (`CHURN_MIN_ROC_AUC`) no superado, 3 entrenado pero no promovido (el actual sigue en servicio). |
+| Reentrenar por drift    | `deploy/scripts/retrain-if-drift.sh` (cron abajo). Consulta `/monitoring/drift` y, si hay drift, reentrena con las etiquetas recibidas por `POST /labels` (o con `CHURN_TRAIN_DATA`); **sin etiquetas suficientes no reentrena** (codigo 3 y aviso): reentrenar con el generador sintetico produciria el mismo modelo. |
 | Entrenamiento inicial   | Lo hace `deploy.sh` con datos sinteticos cuando el volumen esta vacio (`docker compose -f docker-compose.prod.yml --profile train run --rm trainer`). |
 | Drift                   | `curl -s localhost:8010/monitoring/drift \| python3 -m json.tool`       |
 | Metricas                | `curl -s localhost:8010/metrics` (Prometheus; apuntar un scraper dentro de la VPN) |
@@ -184,10 +188,16 @@ Notas:
   `/models/versions/` con `promotion.decision = rejected`. Tras un rollback de modelo en la
   API el alias no cambia (la API no habla con MLflow por diseno). `/model/versions` es la
   fuente de verdad de lo que hay en servicio.
-- Las etiquetas (`churn` real) llegan del negocio semanas despues de la prediccion: el
-  fichero de `CHURN_TRAIN_DATA` hay que construirlo fuera de la plataforma (export del CRM
-  o del warehouse con las mismas columnas que el contrato de la API). Para ensayar el ciclo
-  sin datos reales: `python scripts/generate_data.py --drift-shift 1.0 --out data/churn-drift.csv`.
+- Las etiquetas (`churn` real) llegan del negocio semanas despues de la prediccion: el CRM
+  (o un job del warehouse) debe guardar el `prediction_id` de cada cliente puntuado y
+  devolverlo con `POST /labels` cuando conozca el resultado. Las predicciones solo se pueden
+  etiquetar mientras siguen en el almacen (`CHURN_PREDICTION_KEEP_ROWS`, 100 000 por
+  defecto); las ya etiquetadas se conservan aparte sin limite y son el dataset de reentreno.
+  `CHURN_TRAIN_DATA` sigue disponible para reentrenar con un export propio (mismas columnas
+  que el contrato de la API). Para ensayar el ciclo sin datos reales:
+  `python scripts/generate_data.py --drift-shift 1.0 --out data/churn-drift.csv`.
+- `drift.sqlite` (predicciones y etiquetas) vive en el volumen `models`, asi que
+  `backup.sh` lo archiva junto a los modelos; perderlo significa perder las etiquetas.
 - Tras reconstruir la imagen con otra version menor de scikit-learn, la API rechazara los
   modelos antiguos (503 + motivo en el log). Reentrena, o arranca con
   `CHURN_STRICT_ARTIFACT_COMPAT=false` si asumes el riesgo.
