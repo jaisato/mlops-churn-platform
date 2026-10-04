@@ -15,6 +15,7 @@ como una linea JSON y alimenta las metricas Prometheus de /metrics.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -52,6 +53,11 @@ from churn.serving.schemas import (
 
 logger = logging.getLogger(__name__)
 access_logger = logging.getLogger("churn.access")
+
+# X-Request-ID aceptado del cliente: corto y sin caracteres raros. Cualquier otro valor
+# se sustituye por uno generado (se reflejaba tal cual en la respuesta y en cada linea
+# de log, sin limite de tamano).
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
 @dataclass(frozen=True)
@@ -167,7 +173,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def observability(request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or uuid4().hex[:16]
+        incoming = request.headers.get("x-request-id", "")
+        request_id = incoming if _REQUEST_ID.fullmatch(incoming) else uuid4().hex[:16]
         token = request_id_var.set(request_id)
         started = time.perf_counter()
         try:
@@ -191,6 +198,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return model
 
     def _require_admin(token: str) -> None:
+        # Sin token configurado (CHURN_ADMIN_TOKEN="" fuera de produccion) la comparacion
+        # con la cabecera vacia daba acceso a cualquiera: se cierra en vez de abrirse.
+        if not settings.admin_token:
+            raise HTTPException(
+                status_code=503,
+                detail="Operaciones de administracion deshabilitadas: CHURN_ADMIN_TOKEN vacio",
+            )
         # compare_digest: comparacion en tiempo constante (no filtra el token por timing)
         if not secrets.compare_digest(token.encode(), settings.admin_token.encode()):
             raise HTTPException(status_code=401, detail="Token de administracion invalido")

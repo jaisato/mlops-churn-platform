@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from churn.data.generator import FEATURE_COLUMNS, generate_dataset
 from tests.conftest import ADMIN_HEADERS
 from tests.test_api import CUSTOMER, CUSTOMER_FIEL, _customers_from
@@ -140,3 +142,11 @@ def test_api_key_no_afecta_a_salud_metricas_ni_admin(client_factory):
 def test_sin_api_key_configurada_los_endpoints_quedan_abiertos(client):
     assert client.post("/predict", json=CUSTOMER).status_code == 200
     assert client.get("/model/info").status_code == 200
+
+
+@pytest.mark.parametrize("valor", ["con espacios", "x" * 129, "id;rm", "a/b"])
+def test_request_id_invalido_se_sustituye(client, valor):
+    """El X-Request-ID del cliente se reflejaba sin validar (tamano y caracteres)."""
+    resp = client.get("/health", headers={"X-Request-ID": valor})
+    assert resp.headers["X-Request-ID"] != valor
+    assert len(resp.headers["X-Request-ID"]) == 16

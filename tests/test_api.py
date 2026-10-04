@@ -186,6 +186,15 @@ def test_model_reload_requiere_token(client):
     assert resp.json()["reloaded"] is True
 
 
+def test_admin_sin_token_configurado_se_cierra(client_factory):
+    """Con CHURN_ADMIN_TOKEN="" (permitido fuera de produccion) la cabecera vacia o ausente
+    coincidia con el token y cualquiera podia recargar o hacer rollback."""
+    c, _ = client_factory(seed=43, admin_token="")
+    for path in ("/model/reload", "/model/rollback"):
+        assert c.post(path).status_code == 503
+        assert c.post(path, headers={"X-Admin-Token": ""}).status_code == 503
+
+
 def test_model_reload_token_incorrecto_401(client):
     resp = client.post("/model/reload", headers={"X-Admin-Token": "token-tes"})
     assert resp.status_code == 401
