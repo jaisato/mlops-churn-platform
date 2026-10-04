@@ -39,8 +39,13 @@ if [ -n "${CHURN_API_KEY:-}" ]; then auth=(-H "X-API-Key: ${CHURN_API_KEY}"); fi
 notify() {
   echo ">> $1"
   if [ -n "${WEBHOOK_URL:-}" ]; then
-    curl -fsS -X POST -H 'Content-Type: application/json' \
-      -d "{\"text\": \"[churn] $1\"}" "$WEBHOOK_URL" >/dev/null || echo "!! Aviso no enviado"
+    # JSON construido con json.dumps: el mensaje lleva nombres de fichero y de features, y
+    # una comilla o una barra invertida rompian el JSON concatenado a mano.
+    local payload
+    payload="$(python3 -c 'import json, sys; print(json.dumps({"text": "[churn] " + sys.argv[1]}))' "$1")" \
+      && curl -fsS -X POST -H 'Content-Type: application/json' \
+        -d "$payload" "$WEBHOOK_URL" >/dev/null \
+      || echo "!! Aviso no enviado"
   fi
 }
 

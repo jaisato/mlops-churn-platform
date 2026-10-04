@@ -16,9 +16,13 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/); vers
 - El alias `champion` de MLflow solo se asigna a las versiones promovidas; los runs de las rechazadas se registran con `promotion_decision=rejected` y sin alias.
 
 ### Corregido
+- `retrain-if-drift.sh`: el aviso al webhook se construia concatenando texto en un JSON; una comilla o una barra invertida en el nombre del fichero de datos lo dejaba invalido. Ahora se genera con `json.dumps`.
+- `backup.sh`: la copia se escribe como `.partial` y se renombra al terminar; si `tar` falla ya no queda un `.tgz` truncado con aspecto de copia valida.
 - El reentrenamiento programado no podia corregir el drift: `train.py` siempre entrenaba con `generate_dataset(seed=42)`, asi que cada ejecucion del cron producia el mismo dataset, el mismo modelo y la misma referencia, y el informe de drift no cambiaba. El ciclo drift -> reentreno -> recuperacion que describia el README no ocurria. Ahora requiere datos nuevos etiquetados y un test deja constancia del comportamiento anterior.
 
 ### Seguridad
+- Las operaciones de administracion (`/model/reload`, `/model/rollback`) responden 503 si `CHURN_ADMIN_TOKEN` esta vacio (permitido fuera de produccion): antes una peticion sin cabecera coincidia con el token vacio y se aceptaba.
+- `X-Request-ID` solo se acepta si tiene 1-128 caracteres `[A-Za-z0-9._:-]`; cualquier otro valor se sustituye por uno generado (se reflejaba sin validar en la respuesta y en los logs).
 - `deploy.yml`: el tag del despliegue manual y los secretos llegan a los scripts por `env`, y el tag se valida (`latest`, `X.Y.Z[-pre]` o `sha-<hash>`) antes de viajar en el comando remoto de ssh. Antes se interpolaban con `${{ }}` dentro de `run:`, lo que permitia inyectar comandos en el runner y en el VPS a quien pudiera lanzar el workflow.
 
 ### Corregido

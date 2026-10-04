@@ -78,6 +78,7 @@ url=""; out=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift ;;
+    -d) printf '%s\n' "$2" >> "$STUB_LOG_DIR/curl-data.log"; shift ;;
     http*) url="$1" ;;
   esac
   shift
@@ -232,3 +233,17 @@ def test_retrain_envia_avisos_al_webhook(retrain, tmp_path):
     curl = _log(retrain.logs, "curl")
     assert curl.count("http://hook.test/x") == 2  # "Reentrenando" + "Modelo recargado"
     assert "[churn] Reentrenando con clientes.csv" in curl
+
+
+def test_retrain_webhook_envia_json_valido_con_nombres_raros(retrain, tmp_path):
+    """El JSON del aviso se concatenaba a mano: una comilla o una barra invertida en el
+    nombre del fichero de datos lo dejaba invalido y el webhook lo rechazaba."""
+    import json
+
+    data = tmp_path / 'clientes "q3" \\ final.csv'
+    data.write_text("x")
+    result = retrain(CHURN_TRAIN_DATA=str(data), WEBHOOK_URL="http://hook.test/x")
+    assert result.returncode == 0, result.stdout + result.stderr
+    payloads = [json.loads(line) for line in _log(retrain.logs, "curl-data").splitlines()]
+    assert len(payloads) == 2
+    assert payloads[0]["text"].startswith('[churn] Reentrenando con clientes "q3" \\ final.csv')

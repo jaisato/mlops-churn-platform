@@ -25,8 +25,15 @@ for volume in models mlflow-data; do
     continue
   fi
   file="${volume}-${STAMP}.tgz"
-  docker run --rm -v "${name}:/v:ro" -v "${BACKUP_DIR}:/b" alpine:3.20 \
-    tar czf "/b/${file}" -C /v .
+  # Se escribe con otro nombre y se renombra al terminar: si tar falla (disco lleno,
+  # volumen ilegible) no queda un .tgz truncado que parezca una copia valida.
+  if ! docker run --rm -v "${name}:/v:ro" -v "${BACKUP_DIR}:/b" alpine:3.20 \
+    tar czf "/b/${file}.partial" -C /v .; then
+    rm -f "${BACKUP_DIR}/${file}.partial"
+    echo "!! Fallo al copiar ${name}" >&2
+    exit 1
+  fi
+  mv "${BACKUP_DIR}/${file}.partial" "${BACKUP_DIR}/${file}"
   echo ">> ${BACKUP_DIR}/${file} ($(du -h "${BACKUP_DIR}/${file}" | cut -f1))"
 done
 
