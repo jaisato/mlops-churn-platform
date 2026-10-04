@@ -13,6 +13,9 @@ services:
       CHURN_ADMIN_TOKEN: ${CHURN_ADMIN_TOKEN:?definir}
       CHURN_API_KEY: ${CHURN_API_KEY:-}                        # vacio = scoring abierto (VPN)
       CHURN_MODEL_KEEP_VERSIONS: ${CHURN_MODEL_KEEP_VERSIONS:-5}
+      CHURN_PREDICTION_KEEP_ROWS: ${CHURN_PREDICTION_KEEP_ROWS:-100000}   # etiquetables (POST /labels)
+      CHURN_PREDICTION_KEEP_DAYS: ${CHURN_PREDICTION_KEEP_DAYS:-0}        # 0 = sin limite de antiguedad
+      CHURN_LABELS_TOKEN: ${CHURN_LABELS_TOKEN:-}   # token propio de POST /labels (vacio = el de admin)
     volumes:
       - models:/models
     restart: unless-stopped
@@ -28,13 +31,15 @@ services:
     profiles: ["train"]
     # Comando por defecto = entrenamiento INICIAL con datos sinteticos (deploy.sh lo usa
     # cuando el volumen esta vacio). Reentrenar con datos reales es otra invocacion:
-    # retrain-if-drift.sh monta CHURN_TRAIN_DATA y pasa `--data` (ver el script).
+    # retrain-if-drift.sh construye /models/datasets/labels.parquet con las etiquetas de la
+    # API (`python -m churn.data.labels`) o monta CHURN_TRAIN_DATA, y pasa `--data`.
     command: python -m churn.training.train --rows 50000 --model-dir /models
     environment:
       CHURN_MLFLOW_TRACKING_URI: http://mlflow:5000
       CHURN_MIN_ROC_AUC: ${CHURN_MIN_ROC_AUC:-0.75}             # gate de calidad del reentreno
       CHURN_PROMOTION_MARGIN: ${CHURN_PROMOTION_MARGIN:-0}      # campeon/retador (0 = al menos igual)
       CHURN_MODEL_KEEP_VERSIONS: ${CHURN_MODEL_KEEP_VERSIONS:-5}
+      CHURN_LABELS_MIN_ROWS: ${CHURN_LABELS_MIN_ROWS:-500}      # etiquetas minimas para reentrenar
     volumes:
       - models:/models
     depends_on:

@@ -13,11 +13,15 @@ build/
 *.egg-info/
 data/local/
 data/*.csv
+data/*.parquet
+data/*.meta.json
 mlruns/
 models/
 .last_tag
 .current_tag
 .previous_tag
+# Cerrojo de retrain-if-drift.sh (una ejecucion a la vez)
+.retrain.lock
 # Metadatos de Windows al copiar ficheros descargados a WSL
 *:Zone.Identifier
 # Permisos locales de Claude Code (por maquina)

@@ -1,6 +1,7 @@
 import json
+from datetime import UTC, datetime, timedelta
 
-from churn.data.generator import FEATURE_COLUMNS, generate_dataset
+from churn.data.generator import FEATURE_COLUMNS, TARGET, generate_dataset
 from churn.registry import LocalModelStore
 from churn.serving.main import risk_level
 from tests.conftest import ADMIN_HEADERS
@@ -33,6 +34,18 @@ def _customers_from(df) -> list[dict]:
     return json.loads(df[FEATURE_COLUMNS].to_json(orient="records"))
 
 
+def _score_and_label(client, df, **label_fields) -> list[dict]:
+    """Puntua las filas de `df` en la API y devuelve su churn real por POST /labels."""
+    predictions = client.post("/predict/batch", json={"customers": _customers_from(df)}).json()
+    labels = [
+        {"prediction_id": p["prediction_id"], "churn": int(churn), **label_fields}
+        for p, churn in zip(predictions["predictions"], df[TARGET], strict=True)
+    ]
+    resp = client.post("/labels", json={"labels": labels}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    return predictions["predictions"]
+
+
 # --------------------------------------------------------------------------- sistema
 
 
@@ -62,6 +75,8 @@ def test_openapi_expone_todos_los_endpoints(client):
         "/model/info",
         "/model/reload",
         "/monitoring/drift",
+        "/monitoring/performance",
+        "/labels",
     } <= set(paths)
     assert client.get("/docs").status_code == 200
 
@@ -120,11 +135,21 @@ def test_predict_batch_limites(client):
 
 
 def test_predict_alimenta_el_almacen_con_version(client):
-    version = client.post("/predict", json=CUSTOMER).json()["model_version"]
+    body = client.post("/predict", json=CUSTOMER).json()
     ultimo = client.app.state.predictions.recent(1).iloc[0].to_dict()
-    assert ultimo["model_version"] == version
+    assert ultimo["model_version"] == body["model_version"]
+    assert ultimo["prediction_id"] == body["prediction_id"]
     assert 0 <= ultimo["churn_probability"] <= 1
     assert all(ultimo[k] == v for k, v in CUSTOMER.items())
+
+
+def test_cada_prediccion_devuelve_un_prediction_id_unico(client):
+    individual = client.post("/predict", json=CUSTOMER).json()["prediction_id"]
+    batch = client.post("/predict/batch", json={"customers": [CUSTOMER, CUSTOMER]}).json()
+    ids = [individual] + [p["prediction_id"] for p in batch["predictions"]]
+    assert len(set(ids)) == 3
+    assert all(len(i) == 32 for i in ids)
+    assert list(client.app.state.predictions.recent(3)["prediction_id"]) == ids
 
 
 def test_almacen_sqlite_sobrevive_al_reinicio_de_la_api(client_factory):
@@ -485,3 +510,323 @@ def test_buffer_respeta_tamano_maximo(client_factory):
     for _ in range(30):
         c.post("/predict", json=CUSTOMER)
     assert c.get("/monitoring/drift").json()["n_current"] == 20
+
+
+# --------------------------------------------------------------------------- bucle de etiquetas
+
+
+def test_labels_requiere_token_de_administracion(client):
+    body = {"labels": [{"prediction_id": "x", "churn": 1}]}
+    assert client.post("/labels", json=body).status_code == 401
+    assert client.post("/labels", json=body, headers={"X-Admin-Token": "otro"}).status_code == 401
+
+
+def test_labels_crea_corrige_y_reporta_desconocidos(client):
+    a, b = (
+        client.post("/predict", json=c).json()["prediction_id"] for c in (CUSTOMER, CUSTOMER_FIEL)
+    )
+    lote = {
+        "labels": [
+            {"prediction_id": a, "churn": 1, "observed_at": "2026-10-01T12:00:00+02:00"},
+            {"prediction_id": b, "churn": 0},
+            {"prediction_id": "desconocido", "churn": 1},
+        ]
+    }
+
+    resp = client.post("/labels", json=lote, headers=ADMIN_HEADERS)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "received": 3,
+        "created": 2,
+        "updated": 0,
+        "unknown": ["desconocido"],
+        "rejected": [],
+        "labelled_total": 2,
+    }
+    store = client.app.state.predictions
+    etiquetas = store.labelled().set_index("prediction_id")
+    assert etiquetas.loc[a, "churn"] == 1 and etiquetas.loc[b, "churn"] == 0
+    assert etiquetas.loc[a, "observed_at"] == "2026-10-01T10:00:00+00:00"  # normalizado a UTC
+    assert etiquetas.loc[a, "tenure_months"] == CUSTOMER["tenure_months"]
+
+    # Idempotente: el mismo lote otra vez no duplica; una correccion sobrescribe
+    lote["labels"][0]["churn"] = 0
+    again = client.post("/labels", json=lote, headers=ADMIN_HEADERS).json()
+    assert again == {
+        "received": 3,
+        "created": 0,
+        "updated": 2,
+        "unknown": ["desconocido"],
+        "rejected": [],
+        "labelled_total": 2,
+    }
+    assert store.labelled().set_index("prediction_id").loc[a, "churn"] == 0
+
+
+def test_labels_observed_at_por_defecto_es_el_instante_de_recepcion(client):
+    prediction_id = client.post("/predict", json=CUSTOMER).json()["prediction_id"]
+    antes = datetime.now(UTC)
+    client.post(
+        "/labels",
+        json={"labels": [{"prediction_id": prediction_id, "churn": 1}]},
+        headers=ADMIN_HEADERS,
+    )
+    observado = datetime.fromisoformat(
+        client.app.state.predictions.labelled().loc[0, "observed_at"]
+    )
+    assert antes <= observado <= datetime.now(UTC)
+
+
+def test_labels_validacion_422(client):
+    prediction_id = client.post("/predict", json=CUSTOMER).json()["prediction_id"]
+
+    def post(labels):
+        return client.post("/labels", json={"labels": labels}, headers=ADMIN_HEADERS).status_code
+
+    assert post([]) == 422
+    assert post([{"prediction_id": prediction_id, "churn": 2}]) == 422
+    assert post([{"prediction_id": prediction_id}]) == 422
+    assert post([{"churn": 1}]) == 422
+    assert post([{"prediction_id": prediction_id, "churn": 1, "observed_at": "ayer"}]) == 422
+    repetido = {"prediction_id": prediction_id, "churn": 1}
+    assert post([repetido, repetido]) == 422
+    assert post([{"prediction_id": f"id-{i}", "churn": 1} for i in range(1001)]) == 422
+    assert client.app.state.predictions.labelled_count() == 0  # nada se guardo a medias
+
+
+def test_labels_funciona_sin_modelo_cargado(client_sin_modelo):
+    resp = client_sin_modelo.post(
+        "/labels", json={"labels": [{"prediction_id": "x", "churn": 1}]}, headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 200
+    assert resp.json()["unknown"] == ["x"] and resp.json()["labelled_total"] == 0
+
+
+def test_labels_persisten_entre_reinicios_de_la_api(client_factory):
+    primero, model_dir = client_factory(seed=111)
+    prediction_id = primero.post("/predict", json=CUSTOMER).json()["prediction_id"]
+    primero.post(
+        "/labels",
+        json={"labels": [{"prediction_id": prediction_id, "churn": 1}]},
+        headers=ADMIN_HEADERS,
+    )
+
+    reiniciado, _ = client_factory(model_dir=model_dir, train_model=False)
+    resp = reiniciado.post(
+        "/labels",
+        json={"labels": [{"prediction_id": prediction_id, "churn": 0}]},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.json()["updated"] == 1 and resp.json()["labelled_total"] == 1
+
+
+# --------------------------------------------------------------------------- rendimiento real
+
+
+def test_performance_flujo(client):
+    assert client.get("/monitoring/performance").status_code == 409  # drift_min_rows=10
+    datos = generate_dataset(40, seed=120)
+    _score_and_label(client, datos)
+
+    resp = client.get("/monitoring/performance")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    version = client.get("/health").json()["model_version"]
+    assert body["serving_version"] == version
+    assert body["holdout_roc_auc"] == client.get("/model/info").json()["metrics"]["roc_auc"]
+    assert body["labelled_total"] == 40
+    assert body["threshold"] == 0.5
+    overall = body["overall"]
+    assert overall["n"] == 40
+    assert overall["churn_rate"] == round(float(datos[TARGET].mean()), 4)
+    assert overall["roc_auc"] > 0.6  # el modelo acierta sobre etiquetas reales del mismo mundo
+    assert set(overall) == {
+        "n",
+        "churn_rate",
+        "roc_auc",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "brier",
+    }
+    assert body["by_version"] == {version: overall}
+
+
+def test_performance_insuficiente_explica_cuantas_faltan(client):
+    _score_and_label(client, generate_dataset(4, seed=121))
+    resp = client.get("/monitoring/performance")
+    assert resp.status_code == 409
+    assert "4/10 predicciones etiquetadas" in resp.json()["detail"]
+
+
+def test_performance_no_exige_modelo_cargado(client_sin_modelo):
+    assert client_sin_modelo.get("/monitoring/performance").status_code == 409
+
+
+def test_performance_distingue_versiones_y_funciona_sin_modelo(client_factory, train_small):
+    c, model_dir = client_factory(seed=122)  # drift_min_rows=5
+    datos = generate_dataset(12, seed=123)
+    _score_and_label(c, datos.head(6))
+    v1 = c.get("/health").json()["model_version"]
+    train_small(model_dir, seed=124)
+    v2 = c.post("/model/reload", headers=ADMIN_HEADERS).json()["model_version"]
+    _score_and_label(c, datos.tail(6))
+
+    body = c.get("/monitoring/performance").json()
+    assert body["serving_version"] == v2
+    assert body["overall"]["n"] == 12
+    assert {k: v["n"] for k, v in body["by_version"].items()} == {v1: 6, v2: 6}
+
+    # Las etiquetas describen lo que ya se sirvio: siguen midiendose aunque el modelo no cargue
+    LocalModelStore(model_dir).metadata_path.write_text("{roto", encoding="utf-8")
+    sin_modelo, _ = client_factory(model_dir=model_dir, train_model=False)
+    assert sin_modelo.get("/health").status_code == 503
+    body = sin_modelo.get("/monitoring/performance").json()
+    assert body["serving_version"] is None and body["holdout_roc_auc"] is None
+    assert body["overall"]["n"] == 12
+
+
+def test_performance_mide_solo_la_ventana_reciente(client_factory):
+    c, _ = client_factory(seed=125, drift_buffer_size=20, drift_min_rows=5)
+    _score_and_label(c, generate_dataset(30, seed=126))
+    body = c.get("/monitoring/performance").json()
+    assert body["labelled_total"] == 30
+    assert body["overall"]["n"] == 20
+
+
+def test_performance_con_una_sola_clase_no_tiene_auc(client):
+    datos = generate_dataset(12, seed=127)
+    datos[TARGET] = 1
+    _score_and_label(client, datos)
+    body = client.get("/monitoring/performance").json()
+    assert body["overall"]["roc_auc"] is None and body["overall"]["churn_rate"] == 1.0
+    assert all(block["roc_auc"] is None for block in body["by_version"].values())
+
+
+# --------------------------------------------------------------- sujeto, token y rechazos
+
+
+def test_predict_acepta_subject_ref_opcional_y_no_es_una_feature(client):
+    sin = client.post("/predict", json=CUSTOMER).json()
+    con = client.post("/predict", json={**CUSTOMER, "subject_ref": "c-7f3a9c41"}).json()
+    assert con["churn_probability"] == sin["churn_probability"]  # no llega al modelo
+    assert "subject_ref" not in con  # la respuesta no cambia (contrato aditivo)
+    recientes = client.app.state.predictions.recent(2)
+    assert list(recientes["subject_ref"]) == [None, "c-7f3a9c41"]
+
+
+def test_predict_batch_subject_ref_por_cliente(client):
+    customers = [
+        {**CUSTOMER, "subject_ref": "c-1"},
+        CUSTOMER_FIEL,
+        {**CUSTOMER, "subject_ref": "c-3"},
+    ]
+    resp = client.post("/predict/batch", json={"customers": customers})
+    assert resp.status_code == 200
+    assert list(client.app.state.predictions.recent(3)["subject_ref"]) == ["c-1", None, "c-3"]
+
+
+def test_subject_ref_validacion(client):
+    assert client.post("/predict", json={**CUSTOMER, "subject_ref": ""}).status_code == 422
+    assert client.post("/predict", json={**CUSTOMER, "subject_ref": "x" * 129}).status_code == 422
+    assert client.post("/predict", json={**CUSTOMER, "subject_ref": "x" * 128}).status_code == 200
+
+
+def test_labels_rechaza_observed_at_anterior_a_la_prediccion_y_guarda_el_sujeto(client):
+    a, b = (client.post("/predict", json=c).json()["prediction_id"] for c in (CUSTOMER, CUSTOMER))
+    resp = client.post(
+        "/labels",
+        json={
+            "labels": [
+                {"prediction_id": a, "churn": 1, "observed_at": "2020-01-01T00:00:00Z"},
+                {"prediction_id": b, "churn": 0, "subject_ref": "c-b"},
+            ]
+        },
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["created"], body["rejected"], body["unknown"]) == (1, [a], [])
+    etiquetas = client.app.state.predictions.labelled()
+    assert list(etiquetas["prediction_id"]) == [b] and list(etiquetas["subject_ref"]) == ["c-b"]
+
+
+def test_labels_observed_at_futura_es_422_con_holgura(client):
+    prediction_id = client.post("/predict", json=CUSTOMER).json()["prediction_id"]
+
+    def post(observed_at: datetime):
+        label = {"prediction_id": prediction_id, "churn": 1, "observed_at": observed_at.isoformat()}
+        return client.post("/labels", json={"labels": [label]}, headers=ADMIN_HEADERS)
+
+    futura = post(datetime.now(UTC) + timedelta(hours=2))
+    assert futura.status_code == 422 and "futura" in futura.text
+    assert post(datetime.now(UTC) + timedelta(minutes=1)).status_code == 200  # desfase de reloj
+    assert client.app.state.predictions.labelled_count() == 1
+
+
+def test_labels_corrige_una_etiqueta_cuya_prediccion_ya_salio_de_la_ventana(client_factory):
+    c, _ = client_factory(seed=140, prediction_keep_rows=5, drift_buffer_size=5)
+    prediction_id = c.post("/predict", json=CUSTOMER).json()["prediction_id"]
+    lote = {"labels": [{"prediction_id": prediction_id, "churn": 1}]}
+    assert c.post("/labels", json=lote, headers=ADMIN_HEADERS).json()["created"] == 1
+    for _ in range(6):  # la prediccion sale de la ventana (5)
+        c.post("/predict", json=CUSTOMER_FIEL)
+
+    lote["labels"][0]["churn"] = 0
+    resp = c.post("/labels", json=lote, headers=ADMIN_HEADERS).json()
+
+    assert (resp["updated"], resp["unknown"], resp["labelled_total"]) == (1, [], 1)
+    assert c.app.state.predictions.labelled().loc[0, "churn"] == 0
+
+
+def test_labels_con_token_propio(client_factory):
+    c, _ = client_factory(seed=141, labels_token="token-etiquetas-0123456789")
+    lote = {"labels": [{"prediction_id": "x", "churn": 1}]}
+    propio = {"X-Labels-Token": "token-etiquetas-0123456789"}
+
+    assert c.post("/labels", json=lote, headers=propio).status_code == 200
+    assert c.post("/labels", json=lote).status_code == 401
+    assert c.post("/labels", json=lote, headers={"X-Labels-Token": "otro"}).status_code == 401
+    # separacion de funciones: el token de administracion ya no vale para /labels...
+    assert c.post("/labels", json=lote, headers=ADMIN_HEADERS).status_code == 401
+    # ...y el de etiquetas no sirve para operar el modelo
+    assert (
+        c.post("/model/reload", headers={"X-Admin-Token": propio["X-Labels-Token"]}).status_code
+        == 401
+    )
+    assert c.post("/model/reload", headers=ADMIN_HEADERS).status_code == 200
+
+
+def test_labels_autentica_antes_de_validar_el_cuerpo(client_factory, client):
+    invalido = {"labels": [{"prediction_id": "", "churn": 7}] * 3}
+    assert client.post("/labels", json=invalido).status_code == 401  # no un 422 descriptivo
+    assert client.post("/labels", json=invalido, headers=ADMIN_HEADERS).status_code == 422
+    c, _ = client_factory(seed=142, labels_token="token-etiquetas-0123456789")
+    assert c.post("/labels", json=invalido).status_code == 401
+
+
+def test_produccion_avisa_si_labels_no_tiene_token_propio(tmp_path, caplog):
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from churn.serving.main import create_app
+    from tests.conftest import make_settings
+
+    def arrancar(**overrides) -> str:
+        app = create_app(
+            make_settings(
+                str(tmp_path), environment="production", admin_token="a" * 32, **overrides
+            )
+        )
+        logging.getLogger().addHandler(caplog.handler)  # create_app reconfigura el logging
+        caplog.clear()
+        with TestClient(app):
+            pass
+        return caplog.text
+
+    assert "CHURN_LABELS_TOKEN no definido" in arrancar()
+    assert "CHURN_LABELS_TOKEN no definido" not in arrancar(labels_token="b" * 32)

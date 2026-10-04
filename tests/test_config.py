@@ -14,6 +14,8 @@ def test_valores_por_defecto():
     assert (s.drift_min_rows, s.drift_buffer_size, s.psi_alert_threshold) == (200, 5000, 0.2)
     assert s.min_roc_auc == 0.75
     assert s.promotion_margin == 0.0
+    assert (s.prediction_keep_rows, s.prediction_keep_days, s.labels_min_rows) == (100_000, 0, 500)
+    assert s.labels_token == ""
     assert s.is_production is False
 
 
@@ -53,6 +55,50 @@ def test_drift_min_rows_no_puede_superar_el_buffer():
 def test_drift_min_rows_minimo_2():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, drift_min_rows=1)
+
+
+def test_la_retencion_de_predicciones_cubre_la_ventana_de_drift(monkeypatch):
+    with pytest.raises(ValidationError, match="prediction_keep_rows"):
+        Settings(_env_file=None, drift_buffer_size=5000, prediction_keep_rows=4999)
+    s = Settings(_env_file=None, drift_buffer_size=5000, prediction_keep_rows=5000)
+    assert s.prediction_keep_rows == 5000
+    monkeypatch.setenv("CHURN_PREDICTION_KEEP_ROWS", "250000")
+    monkeypatch.setenv("CHURN_LABELS_MIN_ROWS", "800")
+    s = Settings(_env_file=None)
+    assert (s.prediction_keep_rows, s.labels_min_rows) == (250_000, 800)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, labels_min_rows=0)
+
+
+def test_labels_min_rows_no_baja_del_minimo_del_validador():
+    # por debajo de 500 el dataset se construiria y el trainer lo rechazaria despues
+    with pytest.raises(ValidationError, match="greater than or equal to 500"):
+        Settings(_env_file=None, labels_min_rows=499)
+    assert Settings(_env_file=None, labels_min_rows=500).labels_min_rows == 500
+
+
+def test_prediction_keep_days(monkeypatch):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, prediction_keep_days=-1)
+    monkeypatch.setenv("CHURN_PREDICTION_KEEP_DAYS", "120")
+    assert Settings(_env_file=None).prediction_keep_days == 120
+
+
+def test_labels_token_distinto_del_de_administracion_y_seguro_en_produccion():
+    with pytest.raises(ValidationError, match="distinto de CHURN_ADMIN_TOKEN"):
+        Settings(
+            _env_file=None, admin_token="mismo-token-123456", labels_token="mismo-token-123456"
+        )
+    assert Settings(_env_file=None, labels_token="corto").labels_token == "corto"  # dev: vale
+    prod = {"environment": "production", "admin_token": SECURE_TOKEN}
+    with pytest.raises(ValidationError, match="CHURN_LABELS_TOKEN inseguro"):
+        Settings(_env_file=None, labels_token="corto", **prod)
+    with pytest.raises(ValidationError, match="CHURN_LABELS_TOKEN inseguro"):
+        Settings(_env_file=None, labels_token="genera-un-token-seguro", **prod)
+    assert Settings(_env_file=None, labels_token="b" * 32, **prod).labels_token == "b" * 32
+    assert (
+        Settings(_env_file=None, **prod).labels_token == ""
+    )  # sin token propio: /labels usa admin
 
 
 @pytest.mark.parametrize("env", ["production", "prod", "PRODUCTION"])

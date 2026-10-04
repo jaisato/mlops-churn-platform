@@ -12,6 +12,11 @@ Variables:
     entrenamiento falla y NO sobreescribe los artefactos del modelo en servicio.
     CHURN_PROMOTION_MARGIN     campeon/retador: el modelo nuevo solo pasa a `current`
     si su AUC sobre el holdout de los datos nuevos es >= AUC del campeon - margen.
+Holdout: 20 % de los GRUPOS, elegidos por un hash estable (sal fija) de `subject_ref` (todas
+las predicciones del mismo cliente juntas) o, sin el, del contenido de la fila (filas
+identicas juntas). No depende de la semilla ni del tamano del dataset: entre reentrenos con
+un dataset acumulado, una fila nunca cambia de lado. El campeon se evalua ademas solo con las
+filas predichas despues de las etiquetas con las que se entreno (`predicted_to`).
 Codigos de salida: 0 promovido | 2 datos invalidos o gate no superado | 3 entrenado
 pero no promovido (el campeon sigue en servicio).
 """
@@ -19,6 +24,7 @@ pero no promovido (el campeon sigue en servicio).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import platform
 from datetime import UTC, datetime
@@ -30,8 +36,7 @@ import pandas as pd
 import sklearn
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
@@ -41,15 +46,26 @@ from churn.data.generator import CATEGORICAL_FEATURES, FEATURE_COLUMNS, NUMERIC_
 from churn.data.sources import dataset_fingerprint, resolve_training_data
 from churn.data.validation import validate_training_data
 from churn.logging_conf import configure_logging
+from churn.monitoring.performance import DECISION_THRESHOLD, classification_metrics
+from churn.monitoring.store import PREDICTED_AT_COLUMN, SUBJECT_COLUMN
 from churn.registry import LoadedModel, LocalModelStore
 
 logger = logging.getLogger(__name__)
 
 REFERENCE_SAMPLE_SIZE = 2000
-DECISION_THRESHOLD = 0.5
 EXIT_OK = 0
 EXIT_REJECTED = 2
 EXIT_NOT_PROMOTED = 3
+
+TEST_SIZE = 0.2
+SPLIT_METHOD = "group_hash"
+#: Sal del hash del holdout. Cambiarla reparte de nuevo todas las filas (y mezclaria el
+#: holdout de un reentreno con lo que el campeon vio al entrenar): solo con un buen motivo.
+SPLIT_SALT = "churn-holdout-v1"
+#: Grupos independientes (sujetos, o filas sin sujeto) minimos, con ambas clases, para decidir
+#: entre campeon y retador: 240 filas de 60 clientes son 60 observaciones, no 240. Es el
+#: holdout esperado del dataset minimo (500 x 20 % = 100) con holgura para su variacion.
+MIN_COMPARISON_GROUPS = 80
 
 
 class ModelQualityError(ValueError):
@@ -85,6 +101,49 @@ def runtime_versions() -> dict[str, str]:
     }
 
 
+def split_groups(df: pd.DataFrame) -> pd.Series:
+    """Grupo de cada fila para separar el holdout.
+
+    `subject_ref` si viene (el mismo cliente puntuado varias veces queda entero de un lado) y,
+    si no, el contenido de las features (las filas identicas quedan juntas).
+    """
+    content = pd.util.hash_pandas_object(df[FEATURE_COLUMNS], index=False)
+    groups = "f:" + content.astype(str)
+    if SUBJECT_COLUMN in df.columns:
+        subjects = df[SUBJECT_COLUMN]
+        has_subject = subjects.notna() & (subjects.astype(str).str.len() > 0)
+        groups = groups.where(~has_subject, "s:" + subjects.astype(str))
+    return groups
+
+
+def holdout_mask(groups: pd.Series, test_size: float = TEST_SIZE) -> np.ndarray:
+    """True en las filas del holdout: hash del grupo (con sal fija) por debajo de `test_size`.
+
+    Determinista y estable: no depende de la semilla, del orden ni del tamano del dataset,
+    asi que al acumular etiquetas una fila que fue de entrenamiento nunca pasa al holdout.
+    """
+    buckets = np.fromiter(
+        (
+            int.from_bytes(
+                hashlib.blake2b(f"{SPLIT_SALT}:{group}".encode(), digest_size=8).digest(), "big"
+            )
+            for group in groups
+        ),
+        dtype=np.uint64,
+        count=len(groups),
+    )
+    return buckets < np.uint64(int(test_size * 2**64))
+
+
+def _auc(y_true: Any, proba: Any) -> float:
+    return round(float(roc_auc_score(y_true, proba)), 4)
+
+
+def _utc_times(values: Any) -> pd.Series:
+    """Instantes ISO-8601 en UTC; lo ilegible queda como NaT (nunca cuenta como posterior)."""
+    return pd.Series(pd.to_datetime(values, utc=True, errors="coerce", format="ISO8601"))
+
+
 def _load_champion(store: LocalModelStore) -> tuple[LoadedModel | None, str | None]:
     """Modelo en servicio, o `(None, motivo)` si no existe o no se puede evaluar."""
     if store.resolve_dir() is None:
@@ -99,25 +158,35 @@ def compare_with_champion(
     store: LocalModelStore,
     x_test: pd.DataFrame,
     y_test: pd.Series,
-    challenger_roc_auc: float,
+    challenger_proba: np.ndarray,
     margin: float,
     *,
     fingerprint: str,
-    seed: int,
+    groups: pd.Series,
+    predicted_at: pd.Series | None = None,
 ) -> dict[str, Any]:
-    """Decide si el retador sustituye al campeon (`current`) sobre el MISMO holdout.
+    """Decide si el retador sustituye al campeon (`current`) sobre las MISMAS filas.
 
-    El holdout sale de los datos nuevos: si el mundo ha cambiado, el campeon (entrenado en
-    el mundo anterior) rinde peor ahi y el retador gana; si los datos nuevos no aportan
-    nada, el campeon se mantiene. Devuelve el bloque `promotion` del metadata.
+    Las filas salen del holdout de los datos nuevos: si el mundo ha cambiado, el campeon
+    (entrenado en el mundo anterior) rinde peor ahi y el retador gana; si los datos nuevos no
+    aportan nada, el campeon se mantiene. Si el campeon se entreno con etiquetas de la API
+    (`data_source.labels.predicted_to`) y el holdout trae `predicted_at`, solo cuentan las
+    filas predichas DESPUES: con un dataset acumulado, el resto puede incluir ejemplos con los
+    que el campeon entreno (y que puntuaria con ventaja). Sin al menos `MIN_COMPARISON_GROUPS`
+    grupos (sujetos) con ambas clases no hay evidencia para sustituirlo. Con los mismos datos que el
+    campeon (misma huella) no se promueve: el retador no puede corregir nada. Devuelve el
+    bloque `promotion` del metadata.
     """
     decision: dict[str, Any] = {
         "decision": "no_champion",
         "margin": margin,
-        "challenger_roc_auc": challenger_roc_auc,
+        "challenger_roc_auc": _auc(y_test, challenger_proba),
         "champion_version": None,
         "champion_roc_auc": None,
         "identical_training_data": False,
+        "evaluated_rows": int(len(y_test)),
+        "evaluated_groups": int(groups.nunique()),
+        "champion_cutoff": None,
         "reason": "",
     }
     champion, why_not = _load_champion(store)
@@ -127,17 +196,55 @@ def compare_with_champion(
 
     decision["champion_version"] = champion.version
     champion_source = champion.metadata.get("data_source") or {}
-    if champion_source.get("fingerprint") == fingerprint and champion.metadata.get("seed") == seed:
+    if champion_source.get("fingerprint") == fingerprint:
         decision["identical_training_data"] = True
+        decision["decision"] = "rejected"
+        decision["reason"] = (
+            f"mismos datos (huella {fingerprint[:12]}) que el campeon {champion.version}: "
+            "reentrenar con ellos no corrige nada; se mantiene el campeon"
+        )
         logger.warning(
-            "Mismos datos (huella %s) y semilla que el campeon %s: el retador es identico; "
-            "reentrenar asi no corrige ningun drift",
+            "Mismos datos (huella %s) que el campeon %s: el retador no aporta nada; no se promueve",
             fingerprint[:12],
             champion.version,
         )
+        return decision
+
+    fresh = np.ones(len(y_test), dtype=bool)
+    cutoff = (champion_source.get("labels") or {}).get("predicted_to")
+    if cutoff and predicted_at is None:
+        logger.warning(
+            "El campeon %s se entreno con etiquetas hasta %s, pero estos datos no traen "
+            "predicted_at: se le evalua con todo el holdout",
+            champion.version,
+            cutoff,
+        )
+    elif cutoff:
+        decision["champion_cutoff"] = cutoff
+        fresh = (_utc_times(predicted_at) > _utc_times([cutoff])[0]).to_numpy()
+    y_eval = y_test[fresh]
+    n_groups = int(groups[fresh].nunique())
+    decision["evaluated_rows"] = int(fresh.sum())
+    decision["evaluated_groups"] = n_groups
+    if n_groups < MIN_COMPARISON_GROUPS or y_eval.nunique() < 2:
+        scope = f"posteriores a las etiquetas del campeon (hasta {cutoff})" if cutoff else "utiles"
+        evidence = f"solo {n_groups} grupos ({len(y_eval)} filas) del holdout {scope}"
+        if margin >= 1.0:  # margen 1 = promover siempre que pase el gate
+            decision["decision"] = "promoted"
+            decision["reason"] = f"{evidence}, pero el margen {margin} promueve sin comparar"
+            return decision
+        decision["decision"] = "rejected"
+        decision["reason"] = (
+            f"{evidence} (minimo {MIN_COMPARISON_GROUPS} grupos con ambas clases): no hay "
+            "evidencia suficiente para sustituir al campeon; se mantiene el campeon"
+        )
+        return decision
+
+    challenger_roc_auc = _auc(y_eval, challenger_proba[fresh])
+    decision["challenger_roc_auc"] = challenger_roc_auc
     try:
-        proba = champion.pipeline.predict_proba(x_test[champion.feature_columns])[:, 1]
-        champion_auc = round(float(roc_auc_score(y_test, proba)), 4)
+        proba = champion.pipeline.predict_proba(x_test[fresh][champion.feature_columns])[:, 1]
+        champion_auc = _auc(y_eval, proba)
     except Exception as exc:  # features distintas, pickle de otra version...
         decision["reason"] = f"se promueve: el campeon no se puede evaluar ({exc})"
         return decision
@@ -184,28 +291,42 @@ def train(
     if not report.is_valid:
         raise ValueError(f"Datos de entrenamiento invalidos: {report.errors}")
 
-    x = df[FEATURE_COLUMNS]
-    y = df[TARGET]
-    x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=0.2, random_state=seed, stratify=y
-    )
+    # Holdout por grupos y estable entre reentrenos (ver `holdout_mask`); las columnas de
+    # trazabilidad del dataset de etiquetas (subject_ref, predicted_at...) no son features.
+    groups = split_groups(df)
+    in_test = holdout_mask(groups)
+    x_train, y_train = df.loc[~in_test, FEATURE_COLUMNS], df.loc[~in_test, TARGET]
+    x_test, y_test = df.loc[in_test, FEATURE_COLUMNS], df.loc[in_test, TARGET]
+    if y_train.nunique() < 2 or y_test.nunique() < 2:
+        raise ValueError(
+            f"El holdout ({len(y_test)} filas) o el entrenamiento ({len(y_train)} filas) no "
+            "tiene ambas clases: hacen falta mas datos etiquetados"
+        )
+    split = {
+        "method": SPLIT_METHOD,
+        "test_size": TEST_SIZE,
+        "groups_train": int(groups[~in_test].nunique()),
+        "groups_test": int(groups[in_test].nunique()),
+        "subject_rows": int(groups.str.startswith("s:").sum()),
+    }
 
     pipeline = build_pipeline(seed=seed)
     pipeline.fit(x_train, y_train)
 
     proba = pipeline.predict_proba(x_test)[:, 1]
-    pred = (proba >= DECISION_THRESHOLD).astype(int)
-    metrics = {
-        "roc_auc": round(float(roc_auc_score(y_test, proba)), 4),
-        "accuracy": round(float(accuracy_score(y_test, pred)), 4),
-        "f1": round(float(f1_score(y_test, pred)), 4),
-        "brier": round(float(brier_score_loss(y_test, proba)), 4),
+    # Las mismas metricas (y el mismo umbral) que /monitoring/performance mide en produccion
+    # con las etiquetas reales: holdout y servicio son comparables cifra a cifra.
+    holdout = classification_metrics(y_test, proba, DECISION_THRESHOLD)
+    roc_auc = float(holdout["roc_auc"] or 0.0)  # ambas clases garantizadas arriba
+    metrics: dict[str, Any] = {
+        **holdout,
+        "roc_auc": roc_auc,
         "churn_rate_train": round(float(y_train.mean()), 4),
         "n_train": int(len(x_train)),
         "n_test": int(len(x_test)),
     }
 
-    quality_gate = {"min_roc_auc": min_roc_auc, "passed": metrics["roc_auc"] >= min_roc_auc}
+    quality_gate = {"min_roc_auc": min_roc_auc, "passed": roc_auc >= min_roc_auc}
     if not quality_gate["passed"]:
         raise ModelQualityError(
             f"AUC {metrics['roc_auc']} por debajo del minimo {min_roc_auc}: "
@@ -221,10 +342,13 @@ def train(
         store,
         x_test,
         y_test,
-        metrics["roc_auc"],
+        proba,
         promotion_margin,
         fingerprint=source["fingerprint"],
-        seed=seed,
+        groups=groups[in_test],
+        predicted_at=(
+            df.loc[in_test, PREDICTED_AT_COLUMN] if PREDICTED_AT_COLUMN in df.columns else None
+        ),
     )
     promoted = promotion["decision"] != "rejected"
 
@@ -239,6 +363,7 @@ def train(
         "quality_gate": quality_gate,
         "promotion": promotion,
         "data_source": source,
+        "split": split,
         "numeric_features": NUMERIC_FEATURES,
         "categorical_features": CATEGORICAL_FEATURES,
         "runtime": runtime_versions(),

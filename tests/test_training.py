@@ -12,7 +12,10 @@ import sklearn
 from churn import __version__
 from churn.config import Settings
 from churn.data.generator import CATEGORICAL_FEATURES, NUMERIC_FEATURES, generate_dataset
+from churn.data.labels import write_labelled_dataset
+from churn.monitoring.store import SqlitePredictionStore
 from churn.registry import LocalModelStore
+from churn.serving.schemas import ModelInfoResponse
 from churn.training import train as train_module
 from churn.training.train import (
     ModelQualityError,
@@ -22,7 +25,7 @@ from churn.training.train import (
     runtime_versions,
     train,
 )
-from tests.conftest import SMALL_ROWS, weak_pipeline
+from tests.conftest import SMALL_ROWS, score_and_label, weak_pipeline
 
 
 def test_entrenamiento_genera_artefactos(tmp_path):
@@ -65,6 +68,9 @@ def test_metricas_minimas_de_calidad(tmp_path):
     metadata = train(df, model_dir=str(tmp_path), seed=13)
     assert metadata["metrics"]["roc_auc"] > 0.80
     assert 0 < metadata["metrics"]["f1"] <= 1
+    # Las mismas metricas (y umbral 0.5) que /monitoring/performance mide con etiquetas reales
+    assert {"roc_auc", "accuracy", "precision", "recall", "f1", "brier"} <= set(metadata["metrics"])
+    assert 0 < metadata["metrics"]["precision"] <= 1 and 0 < metadata["metrics"]["recall"] <= 1
 
 
 def test_entrenamiento_rechaza_datos_invalidos(tmp_path):
@@ -382,6 +388,36 @@ def test_cli_entrena_desde_un_fichero(tmp_path, capsys):
     assert metadata["data_source"]["path"] == str(data)
     assert metadata["data_source"]["rows"] == 900
     assert metadata["metrics"]["n_train"] + metadata["metrics"]["n_test"] == 900
+
+
+def test_cli_entrena_desde_el_dataset_de_etiquetas_y_registra_su_ventana(tmp_path, capsys):
+    store = SqlitePredictionStore(tmp_path / "drift.sqlite", max_rows=5000)
+    score_and_label(
+        store, generate_dataset(900, seed=8), version="v-anterior", observed_at="2026-10-01T00:00Z"
+    )
+    summary = write_labelled_dataset(store, tmp_path / "datasets" / "labels.parquet", min_rows=500)
+
+    argv = ["--data", summary["path"], "--seed", "8", "--model-dir", str(tmp_path / "models")]
+    assert main(argv) == 0
+
+    metadata = LocalModelStore(tmp_path / "models").load().metadata
+    source = metadata["data_source"]
+    assert source["kind"] == "file"  # la procedencia de etiquetas va en el bloque `labels`
+    assert source["path"] == summary["path"]
+    assert source["rows"] == 900
+    assert source["fingerprint"] == summary["fingerprint"]  # la huella del sidecar es la real
+    assert source["labels"] == {
+        "built_at": summary["built_at"],
+        "predicted_from": summary["predicted_from"],
+        "predicted_to": summary["predicted_to"],
+        "observed_from": "2026-10-01T00:00:00+00:00",
+        "observed_to": "2026-10-01T00:00:00+00:00",
+        "model_versions": ["v-anterior"],
+        "labels_total": 900,
+        "subjects": 0,
+    }
+    assert ModelInfoResponse(**metadata).data_source.labels.model_versions == ["v-anterior"]
+    assert "labels" in capsys.readouterr().out  # la procedencia queda en el log del trainer
 
 
 def test_cli_fichero_inexistente_devuelve_2(tmp_path, capsys):

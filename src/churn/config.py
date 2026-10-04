@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from churn.data.validation import MIN_ROWS
+
 # Valores de token que NUNCA deben llegar a produccion (defaults y placeholders de ejemplo).
 INSECURE_ADMIN_TOKENS = frozenset(
     {"", "cambia-este-token", "genera-un-token-seguro", "token-local"}
@@ -48,7 +50,9 @@ class Settings(BaseSettings):
     risk_medium: float = Field(default=0.35, ge=0.0, le=1.0)
     risk_high: float = Field(default=0.65, ge=0.0, le=1.0)
 
-    # Monitorizacion de drift
+    # Monitorizacion de drift y de rendimiento real: ambas exigen drift_min_rows observaciones
+    # (predicciones recientes para el drift, predicciones etiquetadas para el rendimiento) y
+    # miran como mucho las drift_buffer_size mas recientes
     drift_min_rows: int = Field(default=200, ge=2)
     drift_buffer_size: int = Field(default=5000, ge=2)
     psi_alert_threshold: float = Field(default=0.2, gt=0.0)
@@ -56,9 +60,24 @@ class Settings(BaseSettings):
     # procesos; fichero drift_db_path o <model_dir>/drift.sqlite) o "memory" (por proceso)
     drift_store: Literal["sqlite", "memory"] = "sqlite"
     drift_db_path: str = ""
+    # Predicciones que se conservan en el almacen para poder etiquetarlas (POST /labels): la
+    # etiqueta real llega semanas despues de puntuar, asi que la retencion es mucho mayor que
+    # la ventana de drift. Dimensionado: predicciones/dia x dias hasta la etiqueta x margen.
+    # Una prediccion desalojada ya no se puede etiquetar (si ya lo estaba, su etiqueta se
+    # conserva y se puede corregir).
+    prediction_keep_rows: int = Field(default=100_000, ge=2)
+    # Antiguedad maxima de las predicciones en dias (0 = sin limite; solo cuenta keep_rows)
+    prediction_keep_days: int = Field(default=0, ge=0)
+    # Minimo de ejemplos etiquetados (tras deduplicar) para construir el dataset de reentreno
+    # (`python -m churn.data.labels`); nunca por debajo del minimo del validador de entrenamiento
+    labels_min_rows: int = Field(default=MIN_ROWS, ge=MIN_ROWS)
 
     # Token para operaciones administrativas (/model/reload, /model/rollback)
     admin_token: str = "cambia-este-token"
+    # Token propio de POST /labels (cabecera X-Labels-Token): el job del CRM que devuelve las
+    # etiquetas no necesita poder recargar ni hacer rollback del modelo. Vacio = /labels exige
+    # el token de administracion (X-Admin-Token), como /model/reload.
+    labels_token: str = ""
     # API key opcional para scoring, informacion del modelo y drift (cabecera X-API-Key).
     # Vacia = endpoints abiertos (la red privada/VPN hace de perimetro).
     api_key: str = ""
@@ -82,19 +101,37 @@ class Settings(BaseSettings):
                 f"drift_min_rows ({self.drift_min_rows}) no puede superar "
                 f"drift_buffer_size ({self.drift_buffer_size}): el drift nunca se calcularia"
             )
+        if self.prediction_keep_rows < self.drift_buffer_size:
+            raise ValueError(
+                f"prediction_keep_rows ({self.prediction_keep_rows}) debe ser al menos "
+                f"drift_buffer_size ({self.drift_buffer_size}): la ventana de drift se lee "
+                "del mismo almacen"
+            )
         if self.is_production and not self.admin_token_is_secure:
             raise ValueError(
                 "CHURN_ADMIN_TOKEN inseguro para produccion: define un token aleatorio de al "
                 f"menos {MIN_ADMIN_TOKEN_LENGTH} caracteres (p. ej. `openssl rand -hex 32`)"
             )
+        if self.labels_token:
+            if self.labels_token == self.admin_token:
+                raise ValueError(
+                    "CHURN_LABELS_TOKEN debe ser distinto de CHURN_ADMIN_TOKEN: su razon de ser "
+                    "es que quien envia etiquetas no pueda recargar ni hacer rollback del modelo"
+                )
+            if self.is_production and not _is_secure_token(self.labels_token):
+                raise ValueError(
+                    "CHURN_LABELS_TOKEN inseguro para produccion: define un token aleatorio de "
+                    f"al menos {MIN_ADMIN_TOKEN_LENGTH} caracteres (p. ej. `openssl rand -hex 32`)"
+                )
         return self
 
     @property
     def admin_token_is_secure(self) -> bool:
-        return (
-            self.admin_token not in INSECURE_ADMIN_TOKENS
-            and len(self.admin_token) >= MIN_ADMIN_TOKEN_LENGTH
-        )
+        return _is_secure_token(self.admin_token)
+
+
+def _is_secure_token(token: str) -> bool:
+    return token not in INSECURE_ADMIN_TOKENS and len(token) >= MIN_ADMIN_TOKEN_LENGTH
 
 
 @lru_cache
