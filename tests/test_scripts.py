@@ -1,8 +1,10 @@
+import fcntl
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +14,7 @@ from churn.data.generator import FEATURE_COLUMNS, TARGET, DriftSpec, generate_da
 
 REPO = Path(__file__).resolve().parents[1]
 RETRAIN_SCRIPT = REPO / "deploy" / "scripts" / "retrain-if-drift.sh"
+BACKUP_SCRIPT = REPO / "deploy" / "scripts" / "backup.sh"
 
 
 def test_generate_data_funciona_desde_cualquier_cwd(tmp_path):
@@ -84,6 +87,7 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   */monitoring/drift) printf '%s' "$DRIFT_BODY" > "$out"; printf '%s' "${DRIFT_HTTP:-200}" ;;
+  */model/info) printf '%s' "${MODEL_INFO_BODY:-}" ;;
   */model/reload) exit 0 ;;
   */health) printf '{"model_version": "v-nueva"}' ;;
   *) exit 22 ;;
@@ -166,6 +170,7 @@ def retrain(tmp_path):
         )
 
     _run.logs = logs  # type: ignore[attr-defined]
+    _run.root = root  # type: ignore[attr-defined]
     return _run
 
 
@@ -198,7 +203,7 @@ def test_retrain_con_drift_pero_sin_etiquetas_suficientes_falla_con_claridad(ret
     result = retrain()  # sin CHURN_TRAIN_DATA y con 120 etiquetas de un minimo de 500
     assert result.returncode == 3
     assert "CHURN_TRAIN_DATA no esta definida" in result.stdout
-    assert "solo hay 120 predicciones etiquetadas de un minimo de 500" in result.stdout
+    assert "solo hay 120 ejemplos etiquetados (120 etiquetas) de un minimo de 500" in result.stdout
     assert "POST /labels" in result.stdout
     assert (
         "tenure_months,monthly_charges" in result.stdout
@@ -315,3 +320,151 @@ def test_retrain_envia_avisos_al_webhook(retrain, tmp_path):
     curl = _log(retrain.logs, "curl")
     assert curl.count("http://hook.test/x") == 2  # "Reentrenando" + "Modelo recargado"
     assert "[churn] Reentrenando con clientes.csv" in curl
+
+
+def test_retrain_no_reentrena_si_no_hay_etiquetas_nuevas_desde_el_modelo_en_servicio(retrain):
+    servido = '{"model_version": "v1", "data_source": {"kind": "file", "fingerprint": "abc"}}'
+    result = retrain(labels=LABELS_OK, labels_exit="0", MODEL_INFO_BODY=servido)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no hay etiquetas nuevas desde el entrenamiento del modelo en servicio" in result.stdout
+    assert "(huella abc)" in result.stdout
+    assert _log(retrain.logs, "docker").splitlines() == [LABELS_BUILD]  # sin entrenar
+    curl = _log(retrain.logs, "curl")
+    assert "/model/info" in curl and "/model/reload" not in curl
+
+
+def test_retrain_con_etiquetas_nuevas_o_sin_model_info_reentrena(retrain):
+    otra = '{"data_source": {"fingerprint": "otra"}}'
+    for body in (otra, "", "{rota"):  # huella distinta, API sin modelo o respuesta ilegible
+        result = retrain(labels=LABELS_OK, labels_exit="0", MODEL_INFO_BODY=body)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Modelo recargado" in result.stdout
+    assert _log(retrain.logs, "docker").count("churn.training.train") == 3
+
+
+def test_retrain_una_sola_ejecucion_a_la_vez(retrain):
+    lock = (retrain.root / ".retrain.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # otra ejecucion en curso
+    try:
+        result = retrain(labels=LABELS_OK, labels_exit="0", WEBHOOK_URL="http://hook.test/x")
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    assert result.returncode == 0
+    assert "Ya hay un reentrenamiento en curso" in result.stdout
+    assert _log(retrain.logs, "docker") == ""
+    curl = _log(retrain.logs, "curl")
+    assert "/monitoring/drift" not in curl and "http://hook.test/x" in curl  # avisa
+
+    libre = retrain(labels=LABELS_OK, labels_exit="0")  # liberado: vuelve a ejecutarse
+    assert libre.returncode == 0 and "Modelo recargado" in libre.stdout
+
+
+# --------------------------------------------------------------------------- backup.sh
+
+BACKUP_DOCKER_STUB = """#!/usr/bin/env bash
+# Doble de docker para backup.sh: registra cada llamada (en una linea) y simula sus salidas.
+line="$*"
+echo "${line//$'\\n'/ }" >> "$STUB_LOG_DIR/docker.log"
+if [ "$1" = volume ]; then
+  [ "$3" != "${MISSING_VOLUME:-}" ]; exit $?
+fi
+case "$*" in
+  compose*) exit "${SNAPSHOT_EXIT:-0}" ;;  # instantanea de drift.sqlite
+esac
+host_b=""; prev=""
+for arg in "$@"; do
+  case "$arg" in *:/b) [ "$prev" = "-v" ] && host_b="${arg%:/b}" ;; esac
+  prev="$arg"
+done
+case "$*" in
+  *"tar czf"*) for arg in "$@"; do case "$arg" in /b/*) : > "$host_b/${arg#/b/}" ;; esac; done ;;
+  *"sh -c"*) [ "${SNAPSHOT_EXISTS:-1}" = 1 ] && : > "$host_b/${*: -1}" ;;
+esac
+exit 0
+"""
+
+
+@pytest.fixture()
+def backup(tmp_path):
+    """Copia backup.sh a un arbol temporal y lo ejecuta con un docker de mentira."""
+    root = tmp_path / "mlops-churn-platform"
+    (root / "deploy" / "scripts").mkdir(parents=True)
+    script = root / "deploy" / "scripts" / "backup.sh"
+    shutil.copy(BACKUP_SCRIPT, script)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    (stubs / "docker").write_text(BACKUP_DOCKER_STUB)
+    (stubs / "docker").chmod(0o755)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    backups = tmp_path / "backups"
+
+    def _run(**env) -> subprocess.CompletedProcess:
+        full_env = {
+            **os.environ,
+            "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
+            "STUB_LOG_DIR": str(logs),
+            "BACKUP_DIR": str(backups),
+            **env,
+        }
+        full_env.pop("COMPOSE_PROJECT_NAME", None)
+        return subprocess.run(
+            ["bash", str(script)], capture_output=True, text=True, timeout=60, env=full_env
+        )
+
+    _run.logs = logs  # type: ignore[attr-defined]
+    _run.backups = backups  # type: ignore[attr-defined]
+    return _run
+
+
+def test_backup_copia_drift_sqlite_con_una_instantanea_y_no_archiva_el_wal_vivo(backup):
+    result = backup()
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    calls = _log(backup.logs, "docker").splitlines()
+    snapshot = next(i for i, c in enumerate(calls) if c.startswith("compose"))
+    tar_models = next(i for i, c in enumerate(calls) if "models:/v" in c and "tar czf" in c)
+    assert snapshot < tar_models  # primero la instantanea, despues el archivo del volumen
+    assert calls[snapshot].startswith(
+        "compose -f docker-compose.prod.yml --profile train run --rm --no-deps -T trainer python -c"
+    )
+    assert calls[snapshot].endswith("/models/drift.sqlite /models/.backup-drift.sqlite")
+    assert "source.backup(target)" in calls[snapshot]  # API de backup de SQLite, no cp ni tar
+    for vivo in ("./drift.sqlite", "./drift.sqlite-wal", "./drift.sqlite-shm"):
+        assert f"--exclude {vivo} " in calls[tar_models]
+    tar_mlflow = next(c for c in calls if "mlflow-data:/v" in c and "tar czf" in c)
+    assert "--exclude" not in tar_mlflow
+    nombres = sorted(f.name.split("-2")[0] for f in backup.backups.iterdir())
+    assert nombres == ["drift", "mlflow-data", "models"]
+    assert "instantanea consistente" in result.stdout
+
+
+def test_backup_sin_drift_sqlite_solo_archiva_los_volumenes(backup):
+    result = backup(SNAPSHOT_EXISTS="0")  # API sin predicciones todavia: nada que copiar
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(f.name.split("-2")[0] for f in backup.backups.iterdir()) == [
+        "mlflow-data",
+        "models",
+    ]
+
+
+def test_backup_falla_si_no_puede_hacer_la_instantanea(backup):
+    result = backup(SNAPSHOT_EXIT="1")
+    assert result.returncode != 0  # mejor una alerta que una copia inconsistente
+    assert "tar czf" not in _log(backup.logs, "docker")
+
+
+def test_backup_omite_volumenes_inexistentes_y_aplica_la_retencion(backup):
+    backup.backups.mkdir()
+    vieja = backup.backups / "drift-20200101T000000Z.sqlite"
+    vieja.write_text("x")
+    hace_un_mes = time.time() - 30 * 86400
+    os.utime(vieja, (hace_un_mes, hace_un_mes))
+
+    result = backup(MISSING_VOLUME="mlops-churn-platform_mlflow-data", KEEP_DAYS="14")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "El volumen mlops-churn-platform_mlflow-data no existe; se omite" in result.stdout
+    assert not vieja.exists()
+    assert sorted(f.name.split("-2")[0] for f in backup.backups.iterdir()) == ["drift", "models"]

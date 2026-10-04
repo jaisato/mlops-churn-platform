@@ -14,6 +14,8 @@ services:
       CHURN_API_KEY: ${CHURN_API_KEY:-}                        # vacio = scoring abierto (VPN)
       CHURN_MODEL_KEEP_VERSIONS: ${CHURN_MODEL_KEEP_VERSIONS:-5}
       CHURN_PREDICTION_KEEP_ROWS: ${CHURN_PREDICTION_KEEP_ROWS:-100000}   # etiquetables (POST /labels)
+      CHURN_PREDICTION_KEEP_DAYS: ${CHURN_PREDICTION_KEEP_DAYS:-0}        # 0 = sin limite de antiguedad
+      CHURN_LABELS_TOKEN: ${CHURN_LABELS_TOKEN:-}   # token propio de POST /labels (vacio = el de admin)
     volumes:
       - models:/models
     restart: unless-stopped
