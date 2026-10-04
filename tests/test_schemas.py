@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from pydantic import ValidationError
 
@@ -5,13 +7,17 @@ from churn.data.generator import CONTRACT_TYPES, FEATURE_COLUMNS, PAYMENT_METHOD
 from churn.data.validation import RANGES
 from churn.serving.schemas import (
     EXAMPLE_CUSTOMER,
+    OBSERVED_AT_FUTURE_TOLERANCE,
+    BatchPredictionRequest,
     CustomerFeatures,
     DataSource,
     DriftResponse,
     LabelIn,
     LabelsRequest,
+    LabelsResponse,
     ModelInfoResponse,
     PerformanceResponse,
+    PredictionRequest,
     PredictionResponse,
 )
 
@@ -160,3 +166,46 @@ def test_performance_response_admite_auc_indefinido():
     )
     assert resp.serving_version is None and resp.holdout_roc_auc is None
     assert resp.by_version["v1"].roc_auc is None
+
+
+# --------------------------------------------------------------------------- sujeto y tiempos
+
+
+def test_prediction_request_subject_ref_opcional_y_fuera_de_las_features():
+    sin = PredictionRequest(**EXAMPLE_CUSTOMER)
+    assert sin.subject_ref is None and sin.features() == EXAMPLE_CUSTOMER
+    con = PredictionRequest(**EXAMPLE_CUSTOMER, subject_ref="c-1")
+    assert con.features() == EXAMPLE_CUSTOMER  # no viaja al modelo
+    for invalido in ("", "x" * 129):
+        with pytest.raises(ValidationError):
+            PredictionRequest(**EXAMPLE_CUSTOMER, subject_ref=invalido)
+    batch = BatchPredictionRequest(customers=[{**EXAMPLE_CUSTOMER, "subject_ref": "c-2"}])
+    assert batch.customers[0].subject_ref == "c-2"
+    ejemplo = PredictionRequest.model_json_schema()["examples"][0]
+    assert set(ejemplo) == set(EXAMPLE_CUSTOMER) | {"subject_ref"}
+
+
+def test_label_subject_ref_opcional():
+    assert LabelIn(prediction_id="a", churn=1).subject_ref is None
+    assert LabelIn(prediction_id="a", churn=1, subject_ref="c-1").subject_ref == "c-1"
+    with pytest.raises(ValidationError):
+        LabelIn(prediction_id="a", churn=1, subject_ref="")
+
+
+def test_label_observed_at_no_puede_ser_futura():
+    ahora = datetime.now(UTC)
+    with pytest.raises(ValidationError, match="observed_at futura"):
+        LabelIn(prediction_id="a", churn=1, observed_at=ahora + timedelta(hours=1))
+    # naive = UTC; hora local sin zona dos horas "por delante" se detecta
+    naive = (ahora + timedelta(hours=2)).replace(tzinfo=None)
+    with pytest.raises(ValidationError, match="zona horaria"):
+        LabelIn(prediction_id="a", churn=1, observed_at=naive)
+    holgura = ahora + OBSERVED_AT_FUTURE_TOLERANCE - timedelta(seconds=30)
+    assert LabelIn(prediction_id="a", churn=0, observed_at=holgura).observed_at == holgura
+    assert LabelIn(prediction_id="a", churn=0, observed_at=ahora - timedelta(days=30))
+    assert LabelIn(prediction_id="a", churn=0, observed_at=None).observed_at is None  # JSON null
+
+
+def test_labels_response_rejected_por_defecto_vacio():
+    resp = LabelsResponse(received=1, created=1, updated=0, unknown=[], labelled_total=1)
+    assert resp.rejected == []

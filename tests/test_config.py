@@ -14,7 +14,8 @@ def test_valores_por_defecto():
     assert (s.drift_min_rows, s.drift_buffer_size, s.psi_alert_threshold) == (200, 5000, 0.2)
     assert s.min_roc_auc == 0.75
     assert s.promotion_margin == 0.0
-    assert (s.prediction_keep_rows, s.labels_min_rows) == (100_000, 500)
+    assert (s.prediction_keep_rows, s.prediction_keep_days, s.labels_min_rows) == (100_000, 0, 500)
+    assert s.labels_token == ""
     assert s.is_production is False
 
 
@@ -67,6 +68,30 @@ def test_la_retencion_de_predicciones_cubre_la_ventana_de_drift(monkeypatch):
     assert (s.prediction_keep_rows, s.labels_min_rows) == (250_000, 800)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, labels_min_rows=0)
+
+
+def test_prediction_keep_days(monkeypatch):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, prediction_keep_days=-1)
+    monkeypatch.setenv("CHURN_PREDICTION_KEEP_DAYS", "120")
+    assert Settings(_env_file=None).prediction_keep_days == 120
+
+
+def test_labels_token_distinto_del_de_administracion_y_seguro_en_produccion():
+    with pytest.raises(ValidationError, match="distinto de CHURN_ADMIN_TOKEN"):
+        Settings(
+            _env_file=None, admin_token="mismo-token-123456", labels_token="mismo-token-123456"
+        )
+    assert Settings(_env_file=None, labels_token="corto").labels_token == "corto"  # dev: vale
+    prod = {"environment": "production", "admin_token": SECURE_TOKEN}
+    with pytest.raises(ValidationError, match="CHURN_LABELS_TOKEN inseguro"):
+        Settings(_env_file=None, labels_token="corto", **prod)
+    with pytest.raises(ValidationError, match="CHURN_LABELS_TOKEN inseguro"):
+        Settings(_env_file=None, labels_token="genera-un-token-seguro", **prod)
+    assert Settings(_env_file=None, labels_token="b" * 32, **prod).labels_token == "b" * 32
+    assert (
+        Settings(_env_file=None, **prod).labels_token == ""
+    )  # sin token propio: /labels usa admin
 
 
 @pytest.mark.parametrize("env", ["production", "prod", "PRODUCTION"])

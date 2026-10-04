@@ -77,7 +77,8 @@ class Metrics:
         )
         self.labels_received = Counter(
             "churn_labels_total",
-            "Etiquetas recibidas en POST /labels por resultado (created, updated, unknown)",
+            "Etiquetas recibidas en POST /labels por resultado (created, updated, unknown, "
+            "rejected)",
             ["result"],
             registry=self.registry,
         )
@@ -117,10 +118,13 @@ class Metrics:
             self.prediction_drift_psi.set(predictions["psi"])
         self.drift_detected.set(1 if report["drift_detected"] else 0)
 
-    def observe_labels(self, created: int, updated: int, unknown: int, stored: int) -> None:
+    def observe_labels(
+        self, *, created: int, updated: int, unknown: int, rejected: int, stored: int
+    ) -> None:
         self.labels_received.labels("created").inc(created)
         self.labels_received.labels("updated").inc(updated)
         self.labels_received.labels("unknown").inc(unknown)
+        self.labels_received.labels("rejected").inc(rejected)
         self.set_labels_stored(stored)
 
     def set_labels_stored(self, stored: int) -> None:

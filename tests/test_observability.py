@@ -61,10 +61,12 @@ def test_metrics_de_etiquetas_cuentan_por_resultado(client):
     a, b = (
         client.post("/predict", json=c).json()["prediction_id"] for c in (CUSTOMER, CUSTOMER_FIEL)
     )
+    c = client.post("/predict", json=CUSTOMER).json()["prediction_id"]
     lote = [{"prediction_id": a, "churn": 1}, {"prediction_id": b, "churn": 0}]
+    anterior = {"prediction_id": c, "churn": 1, "observed_at": "2020-01-01T00:00:00Z"}
     client.post(
         "/labels",
-        json={"labels": lote + [{"prediction_id": "x", "churn": 1}]},
+        json={"labels": lote + [{"prediction_id": "x", "churn": 1}, anterior]},
         headers=ADMIN_HEADERS,
     )
     client.post("/labels", json={"labels": lote[:1]}, headers=ADMIN_HEADERS)  # correccion
@@ -73,6 +75,7 @@ def test_metrics_de_etiquetas_cuentan_por_resultado(client):
     assert 'churn_labels_total{result="created"} 2.0' in body
     assert 'churn_labels_total{result="updated"} 1.0' in body
     assert 'churn_labels_total{result="unknown"} 1.0' in body
+    assert 'churn_labels_total{result="rejected"} 1.0' in body  # observada antes de predecir
     assert "churn_labels_stored 2.0" in body
 
 

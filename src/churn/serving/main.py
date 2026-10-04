@@ -5,10 +5,11 @@ la probabilidad devuelta) en un almacen rodante y expone /monitoring/drift para
 compararlas contra la muestra de referencia del entrenamiento (PSI + KS) y contra
 la distribucion de puntuaciones del modelo (prediction drift).
 
-Bucle de etiquetas: cada prediccion devuelve un `prediction_id`; cuando el negocio conoce
-el churn real lo envia a POST /labels (X-Admin-Token) y la API lo guarda junto a la
-prediccion. Con esas etiquetas /monitoring/performance mide el acierto real del modelo y
-`python -m churn.data.labels` construye el dataset de reentreno.
+Bucle de etiquetas: cada prediccion devuelve un `prediction_id` (y guarda el `subject_ref`
+opcional del cliente); cuando el negocio conoce el churn real lo envia a POST /labels
+(X-Labels-Token si CHURN_LABELS_TOKEN esta definido; si no, X-Admin-Token) y la API lo
+guarda junto a la prediccion. Con esas etiquetas /monitoring/performance mide el acierto
+real del modelo y `python -m churn.data.labels` construye el dataset de reentreno.
 
 Operaciones de modelo (autenticadas con X-Admin-Token): /model/reload carga la
 version en servicio del almacen, /model/rollback vuelve a una version anterior.
@@ -41,6 +42,9 @@ from churn.monitoring.store import (
     ID_COLUMN,
     LABEL_COLUMN,
     OBSERVED_AT_COLUMN,
+    SCORE_COLUMN,
+    SUBJECT_COLUMN,
+    VERSION_COLUMN,
     PredictionStore,
     build_prediction_store,
 )
@@ -49,7 +53,6 @@ from churn.serving.metrics import CONTENT_TYPE_LATEST, Metrics
 from churn.serving.schemas import (
     BatchPredictionRequest,
     BatchPredictionResponse,
-    CustomerFeatures,
     DriftResponse,
     HealthResponse,
     LabelsRequest,
@@ -59,6 +62,7 @@ from churn.serving.schemas import (
     ModelVersionInfo,
     ModelVersionsResponse,
     PerformanceResponse,
+    PredictionRequest,
     PredictionResponse,
     ReloadResponse,
     RiskLevel,
@@ -148,6 +152,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.predictions = build_prediction_store(settings)
         # El almacen sobrevive a los reinicios: la metrica no debe esperar al proximo POST /labels
         metrics.set_labels_stored(app.state.predictions.labelled_count())
+        if settings.is_production and not settings.labels_token:
+            logger.warning(
+                "CHURN_LABELS_TOKEN no definido: POST /labels exige el token de administracion; "
+                "define un token propio para el job que envia las etiquetas"
+            )
         _try_load_on_startup(app)
         yield
 
@@ -224,17 +233,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     protected = [Depends(require_api_key)]
 
+    def require_labels_token(
+        x_labels_token: str = Header(default=""), x_admin_token: str = Header(default="")
+    ) -> None:
+        """POST /labels: token propio si CHURN_LABELS_TOKEN esta definido; si no, el de admin.
+
+        Va como dependencia para que una peticion sin credenciales reciba 401 antes de que se
+        valide (y se describa en un 422) un cuerpo de hasta 1000 etiquetas.
+        """
+        if not settings.labels_token:
+            _require_admin(x_admin_token)
+            return
+        if not secrets.compare_digest(x_labels_token.encode(), settings.labels_token.encode()):
+            raise HTTPException(
+                status_code=401, detail="Token de etiquetas invalido o ausente (X-Labels-Token)"
+            )
+
     def _risk(p: float) -> RiskLevel:
         return risk_level(p, settings.risk_medium, settings.risk_high)
 
-    def _score(model: ServedModel, customers: list[CustomerFeatures]) -> list[PredictionResponse]:
-        rows = [c.model_dump() for c in customers]
+    def _score(model: ServedModel, customers: list[PredictionRequest]) -> list[PredictionResponse]:
+        rows = [c.features() for c in customers]  # subject_ref no es una feature
         probas = [float(p) for p in model.pipeline.predict_proba(pd.DataFrame(rows))[:, 1]]
         store: PredictionStore = app.state.predictions
         # El almacen asigna el prediction_id: es la clave con la que volvera la etiqueta real
         ids = store.append(
-            {**row, "churn_probability": p, "model_version": model.version}
-            for row, p in zip(rows, probas, strict=True)
+            {
+                **row,
+                SCORE_COLUMN: p,
+                VERSION_COLUMN: model.version,
+                SUBJECT_COLUMN: customer.subject_ref,
+            }
+            for row, p, customer in zip(rows, probas, customers, strict=True)
         )
         predictions = []
         for prediction_id, p in zip(ids, probas, strict=True):
@@ -356,7 +386,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post(
         "/predict", response_model=PredictionResponse, tags=["scoring"], dependencies=protected
     )
-    def predict(request: Request, features: CustomerFeatures):
+    def predict(request: Request, features: PredictionRequest):
         return _score(_model(request), [features])[0]
 
     @app.post(
@@ -406,17 +436,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ bucle de etiquetas
 
-    @app.post("/labels", response_model=LabelsResponse, tags=["etiquetas"])
-    def labels(request: Request, body: LabelsRequest, x_admin_token: str = Header(default="")):
-        """Churn real de predicciones ya servidas (cabecera `X-Admin-Token`).
+    @app.post(
+        "/labels",
+        response_model=LabelsResponse,
+        tags=["etiquetas"],
+        dependencies=[Depends(require_labels_token)],
+    )
+    def labels(request: Request, body: LabelsRequest):
+        """Churn real de predicciones ya servidas (cabecera `X-Labels-Token` si
+        `CHURN_LABELS_TOKEN` esta definido; si no, `X-Admin-Token`).
 
         Idempotente por `prediction_id`: la ultima etiqueta recibida es la que vale, asi
-        que reenviar un lote deja el almacen igual (esas etiquetas cuentan como `updated`).
-        Los `prediction_id` que no estan (o ya no estan) en el almacen se devuelven en
-        `unknown` sin invalidar el resto del lote. `observed_at` ausente = instante de
-        recepcion.
+        que reenviar un lote deja el almacen igual (esas etiquetas cuentan como `updated`),
+        tambien si la prediccion ya salio de la ventana pero estaba etiquetada. Por elemento,
+        sin invalidar el resto del lote: `unknown` (el id no esta en el almacen) y `rejected`
+        (`observed_at` anterior a la prediccion). `observed_at` ausente = instante de
+        recepcion; futura = 422. `subject_ref` opcional asocia la prediccion a un sujeto.
         """
-        _require_admin(x_admin_token)
         received_at = datetime.now(UTC)
         store: PredictionStore = request.app.state.predictions
         outcome = store.label(
@@ -424,16 +460,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ID_COLUMN: label.prediction_id,
                 LABEL_COLUMN: label.churn,
                 OBSERVED_AT_COLUMN: label.observed_at or received_at,
+                SUBJECT_COLUMN: label.subject_ref,
             }
             for label in body.labels
         )
         stored = store.labelled_count()
-        metrics.observe_labels(outcome.created, outcome.updated, len(outcome.unknown), stored)
+        metrics.observe_labels(
+            created=outcome.created,
+            updated=outcome.updated,
+            unknown=len(outcome.unknown),
+            rejected=len(outcome.rejected),
+            stored=stored,
+        )
         logger.info(
-            "Etiquetas recibidas: %s nuevas, %s corregidas, %s desconocidas; %s en total",
+            "Etiquetas recibidas: %s nuevas, %s corregidas, %s desconocidas, %s rechazadas; "
+            "%s en total",
             outcome.created,
             outcome.updated,
             len(outcome.unknown),
+            len(outcome.rejected),
             stored,
         )
         return LabelsResponse(
@@ -441,6 +486,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             created=outcome.created,
             updated=outcome.updated,
             unknown=outcome.unknown,
+            rejected=outcome.rejected,
             labelled_total=stored,
         )
 

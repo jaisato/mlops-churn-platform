@@ -6,14 +6,25 @@ como enumeraciones en OpenAPI; un test de contrato comprueba que coinciden con
 `churn.data.generator`.
 """
 
-from datetime import datetime
+from collections import Counter
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from churn.data.validation import RANGES
 
 RiskLevel = Literal["bajo", "medio", "alto"]
+
+#: Holgura frente al reloj del servidor para aceptar un `observed_at` (desfase entre relojes).
+OBSERVED_AT_FUTURE_TOLERANCE = timedelta(minutes=5)
+SUBJECT_REF_MAX_LENGTH = 128
+SUBJECT_REF_DESCRIPTION = (
+    "Opcional. Clave OPACA y estable del sujeto (el cliente puntuado), p. ej. un hash de su id "
+    "interno; nunca datos personales. Agrupa las predicciones del mismo cliente: el dataset de "
+    "reentreno se queda con una etiqueta por sujeto y horizonte y el holdout del entrenamiento "
+    "se separa por sujeto, para que un cliente puntuado varias veces no quede a ambos lados"
+)
 
 EXAMPLE_CUSTOMER: dict[str, Any] = {
     "tenure_months": 3,
@@ -45,6 +56,25 @@ class CustomerFeatures(BaseModel):
     payment_method: Literal["domiciliacion", "tarjeta", "transferencia"]
 
 
+def _subject_ref_field() -> Any:
+    return Field(
+        None, min_length=1, max_length=SUBJECT_REF_MAX_LENGTH, description=SUBJECT_REF_DESCRIPTION
+    )
+
+
+class PredictionRequest(CustomerFeatures):
+    """Features del cliente + `subject_ref` opcional (no es una feature: no llega al modelo)."""
+
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{**EXAMPLE_CUSTOMER, "subject_ref": "c-7f3a9c41"}]}
+    )
+
+    subject_ref: str | None = _subject_ref_field()
+
+    def features(self) -> dict[str, Any]:
+        return self.model_dump(exclude={"subject_ref"})
+
+
 class PredictionResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -59,7 +89,7 @@ class PredictionResponse(BaseModel):
 
 
 class BatchPredictionRequest(BaseModel):
-    customers: list[CustomerFeatures] = Field(..., min_length=1, max_length=1000)
+    customers: list[PredictionRequest] = Field(..., min_length=1, max_length=1000)
 
 
 class BatchPredictionResponse(BaseModel):
@@ -70,12 +100,33 @@ class LabelIn(BaseModel):
     """Churn real observado para una prediccion ya servida."""
 
     prediction_id: str = Field(..., min_length=1, max_length=64)
-    churn: Literal[0, 1] = Field(..., description="1 si el cliente se dio de baja, 0 si no")
+    churn: Literal[0, 1] = Field(
+        ...,
+        description="1 si el cliente se dio de baja dentro del horizonte de la prediccion, 0 si "
+        "el horizonte ha vencido sin baja. Un 0 solo es firme cuando el horizonte ha vencido "
+        "(etiqueta madura): enviarlo antes es un falso negativo",
+    )
     observed_at: datetime | None = Field(
         None,
-        description="Cuando se observo el resultado (ISO-8601; naive = UTC). "
-        "Por defecto, el instante de recepcion",
+        description="Cuando se observo el resultado: la fecha de la baja (churn=1) o el cierre "
+        "del horizonte (churn=0), en ISO-8601 (naive = UTC). Por defecto, el instante de "
+        "recepcion. No puede ser anterior a la prediccion (la etiqueta se rechaza) ni futura "
+        "(422; holgura de 5 minutos)",
     )
+    subject_ref: str | None = _subject_ref_field()
+
+    @field_validator("observed_at")
+    @classmethod
+    def _observed_at_no_futura(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return value
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        if aware > datetime.now(UTC) + OBSERVED_AT_FUTURE_TOLERANCE:
+            raise ValueError(
+                f"observed_at futura ({aware.isoformat()}): la etiqueta se envia cuando el "
+                "resultado ya se ha observado (si es hora local, indica la zona horaria)"
+            )
+        return value
 
 
 class LabelsRequest(BaseModel):
@@ -83,8 +134,8 @@ class LabelsRequest(BaseModel):
 
     @model_validator(mode="after")
     def _ids_unicos(self) -> "LabelsRequest":
-        ids = [label.prediction_id for label in self.labels]
-        duplicated = sorted({i for i in ids if ids.count(i) > 1})
+        counts = Counter(label.prediction_id for label in self.labels)
+        duplicated = sorted(i for i, n in counts.items() if n > 1)
         if duplicated:
             raise ValueError(f"prediction_id repetido en el lote: {duplicated}")
         return self
@@ -95,7 +146,14 @@ class LabelsResponse(BaseModel):
     created: int = Field(..., description="Predicciones etiquetadas por primera vez")
     updated: int = Field(..., description="Etiquetas que sobrescriben una anterior")
     unknown: list[str] = Field(
-        ..., description="prediction_id que no estan (o ya no estan) en el almacen"
+        ...,
+        description="prediction_id que no estan en el almacen (ni como prediccion ni como "
+        "etiqueta: nunca existieron o se desalojaron sin llegar a etiquetarse)",
+    )
+    rejected: list[str] = Field(
+        default_factory=list,
+        description="prediction_id cuya observed_at es anterior a la prediccion: la etiqueta "
+        "no se guarda",
     )
     labelled_total: int = Field(..., description="Predicciones etiquetadas en total")
 

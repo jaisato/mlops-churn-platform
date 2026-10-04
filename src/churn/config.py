@@ -72,6 +72,10 @@ class Settings(BaseSettings):
 
     # Token para operaciones administrativas (/model/reload, /model/rollback)
     admin_token: str = "cambia-este-token"
+    # Token propio de POST /labels (cabecera X-Labels-Token): el job del CRM que devuelve las
+    # etiquetas no necesita poder recargar ni hacer rollback del modelo. Vacio = /labels exige
+    # el token de administracion (X-Admin-Token), como /model/reload.
+    labels_token: str = ""
     # API key opcional para scoring, informacion del modelo y drift (cabecera X-API-Key).
     # Vacia = endpoints abiertos (la red privada/VPN hace de perimetro).
     api_key: str = ""
@@ -106,14 +110,26 @@ class Settings(BaseSettings):
                 "CHURN_ADMIN_TOKEN inseguro para produccion: define un token aleatorio de al "
                 f"menos {MIN_ADMIN_TOKEN_LENGTH} caracteres (p. ej. `openssl rand -hex 32`)"
             )
+        if self.labels_token:
+            if self.labels_token == self.admin_token:
+                raise ValueError(
+                    "CHURN_LABELS_TOKEN debe ser distinto de CHURN_ADMIN_TOKEN: su razon de ser "
+                    "es que quien envia etiquetas no pueda recargar ni hacer rollback del modelo"
+                )
+            if self.is_production and not _is_secure_token(self.labels_token):
+                raise ValueError(
+                    "CHURN_LABELS_TOKEN inseguro para produccion: define un token aleatorio de "
+                    f"al menos {MIN_ADMIN_TOKEN_LENGTH} caracteres (p. ej. `openssl rand -hex 32`)"
+                )
         return self
 
     @property
     def admin_token_is_secure(self) -> bool:
-        return (
-            self.admin_token not in INSECURE_ADMIN_TOKENS
-            and len(self.admin_token) >= MIN_ADMIN_TOKEN_LENGTH
-        )
+        return _is_secure_token(self.admin_token)
+
+
+def _is_secure_token(token: str) -> bool:
+    return token not in INSECURE_ADMIN_TOKENS and len(token) >= MIN_ADMIN_TOKEN_LENGTH
 
 
 @lru_cache

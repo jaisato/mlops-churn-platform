@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from churn.data.generator import FEATURE_COLUMNS, TARGET, generate_dataset
 from churn.registry import LocalModelStore
@@ -541,6 +541,7 @@ def test_labels_crea_corrige_y_reporta_desconocidos(client):
         "created": 2,
         "updated": 0,
         "unknown": ["desconocido"],
+        "rejected": [],
         "labelled_total": 2,
     }
     store = client.app.state.predictions
@@ -557,6 +558,7 @@ def test_labels_crea_corrige_y_reporta_desconocidos(client):
         "created": 0,
         "updated": 2,
         "unknown": ["desconocido"],
+        "rejected": [],
         "labelled_total": 2,
     }
     assert store.labelled().set_index("prediction_id").loc[a, "churn"] == 0
@@ -702,3 +704,129 @@ def test_performance_con_una_sola_clase_no_tiene_auc(client):
     body = client.get("/monitoring/performance").json()
     assert body["overall"]["roc_auc"] is None and body["overall"]["churn_rate"] == 1.0
     assert all(block["roc_auc"] is None for block in body["by_version"].values())
+
+
+# --------------------------------------------------------------- sujeto, token y rechazos
+
+
+def test_predict_acepta_subject_ref_opcional_y_no_es_una_feature(client):
+    sin = client.post("/predict", json=CUSTOMER).json()
+    con = client.post("/predict", json={**CUSTOMER, "subject_ref": "c-7f3a9c41"}).json()
+    assert con["churn_probability"] == sin["churn_probability"]  # no llega al modelo
+    assert "subject_ref" not in con  # la respuesta no cambia (contrato aditivo)
+    recientes = client.app.state.predictions.recent(2)
+    assert list(recientes["subject_ref"]) == [None, "c-7f3a9c41"]
+
+
+def test_predict_batch_subject_ref_por_cliente(client):
+    customers = [
+        {**CUSTOMER, "subject_ref": "c-1"},
+        CUSTOMER_FIEL,
+        {**CUSTOMER, "subject_ref": "c-3"},
+    ]
+    resp = client.post("/predict/batch", json={"customers": customers})
+    assert resp.status_code == 200
+    assert list(client.app.state.predictions.recent(3)["subject_ref"]) == ["c-1", None, "c-3"]
+
+
+def test_subject_ref_validacion(client):
+    assert client.post("/predict", json={**CUSTOMER, "subject_ref": ""}).status_code == 422
+    assert client.post("/predict", json={**CUSTOMER, "subject_ref": "x" * 129}).status_code == 422
+    assert client.post("/predict", json={**CUSTOMER, "subject_ref": "x" * 128}).status_code == 200
+
+
+def test_labels_rechaza_observed_at_anterior_a_la_prediccion_y_guarda_el_sujeto(client):
+    a, b = (client.post("/predict", json=c).json()["prediction_id"] for c in (CUSTOMER, CUSTOMER))
+    resp = client.post(
+        "/labels",
+        json={
+            "labels": [
+                {"prediction_id": a, "churn": 1, "observed_at": "2020-01-01T00:00:00Z"},
+                {"prediction_id": b, "churn": 0, "subject_ref": "c-b"},
+            ]
+        },
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert (body["created"], body["rejected"], body["unknown"]) == (1, [a], [])
+    etiquetas = client.app.state.predictions.labelled()
+    assert list(etiquetas["prediction_id"]) == [b] and list(etiquetas["subject_ref"]) == ["c-b"]
+
+
+def test_labels_observed_at_futura_es_422_con_holgura(client):
+    prediction_id = client.post("/predict", json=CUSTOMER).json()["prediction_id"]
+
+    def post(observed_at: datetime):
+        label = {"prediction_id": prediction_id, "churn": 1, "observed_at": observed_at.isoformat()}
+        return client.post("/labels", json={"labels": [label]}, headers=ADMIN_HEADERS)
+
+    futura = post(datetime.now(UTC) + timedelta(hours=2))
+    assert futura.status_code == 422 and "futura" in futura.text
+    assert post(datetime.now(UTC) + timedelta(minutes=1)).status_code == 200  # desfase de reloj
+    assert client.app.state.predictions.labelled_count() == 1
+
+
+def test_labels_corrige_una_etiqueta_cuya_prediccion_ya_salio_de_la_ventana(client_factory):
+    c, _ = client_factory(seed=140, prediction_keep_rows=5, drift_buffer_size=5)
+    prediction_id = c.post("/predict", json=CUSTOMER).json()["prediction_id"]
+    lote = {"labels": [{"prediction_id": prediction_id, "churn": 1}]}
+    assert c.post("/labels", json=lote, headers=ADMIN_HEADERS).json()["created"] == 1
+    for _ in range(6):  # la prediccion sale de la ventana (5)
+        c.post("/predict", json=CUSTOMER_FIEL)
+
+    lote["labels"][0]["churn"] = 0
+    resp = c.post("/labels", json=lote, headers=ADMIN_HEADERS).json()
+
+    assert (resp["updated"], resp["unknown"], resp["labelled_total"]) == (1, [], 1)
+    assert c.app.state.predictions.labelled().loc[0, "churn"] == 0
+
+
+def test_labels_con_token_propio(client_factory):
+    c, _ = client_factory(seed=141, labels_token="token-etiquetas-0123456789")
+    lote = {"labels": [{"prediction_id": "x", "churn": 1}]}
+    propio = {"X-Labels-Token": "token-etiquetas-0123456789"}
+
+    assert c.post("/labels", json=lote, headers=propio).status_code == 200
+    assert c.post("/labels", json=lote).status_code == 401
+    assert c.post("/labels", json=lote, headers={"X-Labels-Token": "otro"}).status_code == 401
+    # separacion de funciones: el token de administracion ya no vale para /labels...
+    assert c.post("/labels", json=lote, headers=ADMIN_HEADERS).status_code == 401
+    # ...y el de etiquetas no sirve para operar el modelo
+    assert (
+        c.post("/model/reload", headers={"X-Admin-Token": propio["X-Labels-Token"]}).status_code
+        == 401
+    )
+    assert c.post("/model/reload", headers=ADMIN_HEADERS).status_code == 200
+
+
+def test_labels_autentica_antes_de_validar_el_cuerpo(client_factory, client):
+    invalido = {"labels": [{"prediction_id": "", "churn": 7}] * 3}
+    assert client.post("/labels", json=invalido).status_code == 401  # no un 422 descriptivo
+    assert client.post("/labels", json=invalido, headers=ADMIN_HEADERS).status_code == 422
+    c, _ = client_factory(seed=142, labels_token="token-etiquetas-0123456789")
+    assert c.post("/labels", json=invalido).status_code == 401
+
+
+def test_produccion_avisa_si_labels_no_tiene_token_propio(tmp_path, caplog):
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    from churn.serving.main import create_app
+    from tests.conftest import make_settings
+
+    def arrancar(**overrides) -> str:
+        app = create_app(
+            make_settings(
+                str(tmp_path), environment="production", admin_token="a" * 32, **overrides
+            )
+        )
+        logging.getLogger().addHandler(caplog.handler)  # create_app reconfigura el logging
+        caplog.clear()
+        with TestClient(app):
+            pass
+        return caplog.text
+
+    assert "CHURN_LABELS_TOKEN no definido" in arrancar()
+    assert "CHURN_LABELS_TOKEN no definido" not in arrancar(labels_token="b" * 32)
