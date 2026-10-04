@@ -60,8 +60,12 @@ class Settings(BaseSettings):
     drift_db_path: str = ""
     # Predicciones que se conservan en el almacen para poder etiquetarlas (POST /labels): la
     # etiqueta real llega semanas despues de puntuar, asi que la retencion es mucho mayor que
-    # la ventana de drift. Una prediccion desalojada ya no se puede etiquetar.
+    # la ventana de drift. Dimensionado: predicciones/dia x dias hasta la etiqueta x margen.
+    # Una prediccion desalojada ya no se puede etiquetar (si ya lo estaba, su etiqueta se
+    # conserva y se puede corregir).
     prediction_keep_rows: int = Field(default=100_000, ge=2)
+    # Antiguedad maxima de las predicciones en dias (0 = sin limite; solo cuenta keep_rows)
+    prediction_keep_days: int = Field(default=0, ge=0)
     # Minimo de predicciones etiquetadas para construir el dataset de reentreno
     # (`python -m churn.data.labels`); el validador de entrenamiento exige ademas >= 500 filas
     labels_min_rows: int = Field(default=500, ge=1)

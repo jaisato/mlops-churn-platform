@@ -1,5 +1,5 @@
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -23,6 +23,31 @@ from churn.training.train import train
 
 SMALL_ROWS = 1200  # suficiente para superar la validacion (>= 500) y el gate de calidad
 ADMIN_HEADERS = {"X-Admin-Token": "token-test"}
+STORE_CLOCK_START = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
+
+
+class TickingClock:
+    """Reloj del almacen de predicciones en los tests: cada lectura avanza `step`.
+
+    Las predicciones (y `labelled_at`) quedan fechadas en septiembre de 2026, en orden
+    estricto, asi que una etiqueta con una fecha fija de octubre siempre es posterior a su
+    prediccion (el almacen rechaza las anteriores) y los tests no dependen del reloj real.
+    """
+
+    def __init__(self, start: datetime = STORE_CLOCK_START, step: timedelta = timedelta(seconds=1)):
+        self.now = start
+        self.step = step
+
+    def __call__(self) -> datetime:
+        self.now += self.step
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def store_clock(monkeypatch) -> TickingClock:
+    clock = TickingClock()
+    monkeypatch.setattr("churn.monitoring.store._utcnow", clock)
+    return clock
 
 
 def score_and_label(
