@@ -80,13 +80,25 @@ class Promotion(BaseModel):
     reason: str
 
 
+class LabelsWindow(BaseModel):
+    """Ventana del dataset construido desde las etiquetas de produccion (sidecar)."""
+
+    built_at: str | None = None
+    predicted_from: str | None = None
+    predicted_to: str | None = None
+    observed_from: str | None = None
+    observed_to: str | None = None
+    model_versions: list[str] = []
+
+
 class DataSource(BaseModel):
-    kind: Literal["synthetic", "file", "dataframe"]
+    kind: Literal["synthetic", "file", "labels", "dataframe"]
     rows: int
     fingerprint: str
     path: str | None = None
     seed: int | None = None
     drift_shift: float | None = None
+    labels: LabelsWindow | None = None
 
 
 class ModelInfoResponse(BaseModel):

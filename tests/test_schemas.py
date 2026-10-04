@@ -6,6 +6,7 @@ from churn.data.validation import RANGES
 from churn.serving.schemas import (
     EXAMPLE_CUSTOMER,
     CustomerFeatures,
+    DataSource,
     DriftResponse,
     ModelInfoResponse,
     PredictionResponse,
@@ -74,3 +75,19 @@ def test_drift_response_valida_estructura_de_features():
             drifted_features=[],
             drift_detected=False,
         )
+
+
+def test_data_source_admite_la_procedencia_de_etiquetas():
+    source = DataSource(
+        kind="labels",
+        rows=600,
+        fingerprint="f" * 64,
+        path="/models/datasets/labels.parquet",
+        labels={"predicted_from": "2026-09-01T00:00:00+00:00", "model_versions": ["v1"]},
+    )
+    assert source.labels is not None
+    assert source.labels.model_versions == ["v1"]
+    assert source.labels.observed_to is None
+    assert DataSource(kind="file", rows=1, fingerprint="f").labels is None
+    with pytest.raises(ValidationError):
+        DataSource(kind="crm", rows=1, fingerprint="f")

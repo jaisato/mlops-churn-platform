@@ -30,7 +30,7 @@ import pandas as pd
 import sklearn
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -41,12 +41,12 @@ from churn.data.generator import CATEGORICAL_FEATURES, FEATURE_COLUMNS, NUMERIC_
 from churn.data.sources import dataset_fingerprint, resolve_training_data
 from churn.data.validation import validate_training_data
 from churn.logging_conf import configure_logging
+from churn.monitoring.performance import DECISION_THRESHOLD, classification_metrics
 from churn.registry import LoadedModel, LocalModelStore
 
 logger = logging.getLogger(__name__)
 
 REFERENCE_SAMPLE_SIZE = 2000
-DECISION_THRESHOLD = 0.5
 EXIT_OK = 0
 EXIT_REJECTED = 2
 EXIT_NOT_PROMOTED = 3
@@ -194,18 +194,19 @@ def train(
     pipeline.fit(x_train, y_train)
 
     proba = pipeline.predict_proba(x_test)[:, 1]
-    pred = (proba >= DECISION_THRESHOLD).astype(int)
-    metrics = {
-        "roc_auc": round(float(roc_auc_score(y_test, proba)), 4),
-        "accuracy": round(float(accuracy_score(y_test, pred)), 4),
-        "f1": round(float(f1_score(y_test, pred)), 4),
-        "brier": round(float(brier_score_loss(y_test, proba)), 4),
+    # Las mismas metricas (y el mismo umbral) que /monitoring/performance mide en produccion
+    # con las etiquetas reales: holdout y servicio son comparables cifra a cifra.
+    holdout = classification_metrics(y_test, proba, DECISION_THRESHOLD)
+    roc_auc = float(holdout["roc_auc"] or 0.0)  # el holdout estratificado tiene ambas clases
+    metrics: dict[str, Any] = {
+        **holdout,
+        "roc_auc": roc_auc,
         "churn_rate_train": round(float(y_train.mean()), 4),
         "n_train": int(len(x_train)),
         "n_test": int(len(x_test)),
     }
 
-    quality_gate = {"min_roc_auc": min_roc_auc, "passed": metrics["roc_auc"] >= min_roc_auc}
+    quality_gate = {"min_roc_auc": min_roc_auc, "passed": roc_auc >= min_roc_auc}
     if not quality_gate["passed"]:
         raise ModelQualityError(
             f"AUC {metrics['roc_auc']} por debajo del minimo {min_roc_auc}: "
