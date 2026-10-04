@@ -91,9 +91,30 @@ esac
 """
 
 DOCKER_STUB = """#!/usr/bin/env bash
+# Doble de docker: registra la llamada; al construir el dataset de etiquetas imprime el
+# resumen JSON (LABELS_BODY) por stdout como hace `python -m churn.data.labels`.
 echo "$*" >> "$STUB_LOG_DIR/docker.log"
+case "$*" in
+  *churn.data.labels*) printf '%s\\n' "$LABELS_BODY"; exit "${LABELS_EXIT:-0}" ;;
+esac
 exit "${DOCKER_EXIT:-0}"
 """
+
+LABELS_OK = (
+    '{"status": "ok", "path": "/models/datasets/labels.parquet", "rows": 640, '
+    '"predicted_from": "2026-09-01T08:00:00+00:00", "predicted_to": "2026-09-28T17:30:00+00:00", '
+    '"fingerprint": "abc"}'
+)
+LABELS_INSUFFICIENT = '{"status": "insufficient", "rows": 120, "min_rows": 500}'
+LABELS_ERROR = '{"status": "error", "error": "Tasa de churn sospechosa: 0.950"}'
+LABELS_BUILD = (
+    "compose -f docker-compose.prod.yml --profile train run --rm --no-deps -T trainer "
+    "python -m churn.data.labels --model-dir /models --out /models/datasets/labels.parquet"
+)
+LABELS_TRAIN = (
+    "compose -f docker-compose.prod.yml --profile train run --rm trainer "
+    "python -m churn.training.train --data /models/datasets/labels.parquet --model-dir /models"
+)
 
 
 @pytest.fixture()
@@ -112,7 +133,15 @@ def retrain(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
 
-    def _run(*, drift=DRIFT_YES, http="200", docker_exit="0", **env) -> subprocess.CompletedProcess:
+    def _run(
+        *,
+        drift=DRIFT_YES,
+        http="200",
+        docker_exit="0",
+        labels=LABELS_INSUFFICIENT,
+        labels_exit="3",
+        **env,
+    ) -> subprocess.CompletedProcess:
         full_env = {
             **os.environ,
             "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
@@ -120,10 +149,13 @@ def retrain(tmp_path):
             "DRIFT_BODY": drift,
             "DRIFT_HTTP": http,
             "DOCKER_EXIT": docker_exit,
+            "LABELS_BODY": labels,
+            "LABELS_EXIT": labels_exit,
             "CHURN_ADMIN_TOKEN": "token-de-prueba-0123456789",
             **env,
         }
-        full_env.pop("CHURN_TRAIN_DATA", None) if "CHURN_TRAIN_DATA" not in env else None
+        if "CHURN_TRAIN_DATA" not in env:
+            full_env.pop("CHURN_TRAIN_DATA", None)
         return subprocess.run(
             ["bash", str(script)],
             capture_output=True,
@@ -162,14 +194,19 @@ def test_retrain_api_caida_devuelve_1(retrain):
     assert _log(retrain.logs, "docker") == ""
 
 
-def test_retrain_con_drift_pero_sin_datos_etiquetados_falla_con_claridad(retrain):
-    result = retrain()
+def test_retrain_con_drift_pero_sin_etiquetas_suficientes_falla_con_claridad(retrain):
+    result = retrain()  # sin CHURN_TRAIN_DATA y con 120 etiquetas de un minimo de 500
     assert result.returncode == 3
     assert "CHURN_TRAIN_DATA no esta definida" in result.stdout
+    assert "solo hay 120 predicciones etiquetadas de un minimo de 500" in result.stdout
+    assert "POST /labels" in result.stdout
     assert (
         "tenure_months,monthly_charges" in result.stdout
     )  # el motivo del reentreno queda en el aviso
-    assert _log(retrain.logs, "docker") == ""  # no se reentrena con el generador sintetico
+    docker = _log(retrain.logs, "docker")
+    assert docker.count("\n") == 1 and LABELS_BUILD in docker  # solo el intento de construirlo
+    assert "churn.training.train" not in docker  # no se reentrena con el generador sintetico
+    assert "/model/reload" not in _log(retrain.logs, "curl")
 
 
 def test_retrain_forzado_tambien_exige_datos(retrain):
@@ -177,6 +214,52 @@ def test_retrain_forzado_tambien_exige_datos(retrain):
     assert result.returncode == 3
     assert "forzado" in result.stdout
     assert "/monitoring/drift" not in _log(retrain.logs, "curl")
+
+
+def test_retrain_sin_train_data_construye_el_dataset_con_las_etiquetas_de_la_api(retrain):
+    result = retrain(labels=LABELS_OK, labels_exit="0", drift=DRIFT_PREDICTIONS)
+    assert result.returncode == 0, result.stdout + result.stderr
+    docker = _log(retrain.logs, "docker").splitlines()
+    assert docker == [LABELS_BUILD, LABELS_TRAIN]  # sin montar nada: el dataset vive en el volumen
+    assert "640 filas etiquetadas (predicciones del 2026-09-01T08:00:00+00:00 al" in result.stdout
+    assert "Reentrenando con etiquetas de la API (640 filas etiquetadas): drift" in result.stdout
+    curl = _log(retrain.logs, "curl")
+    assert "/model/reload" in curl
+    assert (
+        "Modelo recargado: version v-nueva (drift detectado (predicciones), datos etiquetas de "
+        "la API (640 filas etiquetadas))" in result.stdout
+    )
+
+
+def test_retrain_con_train_data_no_construye_el_dataset_de_etiquetas(retrain, tmp_path):
+    data = tmp_path / "clientes.csv"
+    data.write_text("x")
+    result = retrain(CHURN_TRAIN_DATA=str(data), labels=LABELS_OK, labels_exit="0")
+    assert result.returncode == 0
+    docker = _log(retrain.logs, "docker")
+    assert "churn.data.labels" not in docker and "--data /data/clientes.csv" in docker
+
+
+def test_retrain_dataset_de_etiquetas_invalido_sale_2(retrain):
+    result = retrain(labels=LABELS_ERROR, labels_exit="2")
+    assert result.returncode == 2
+    assert "no se pudo construir el dataset de etiquetas (codigo 2): Tasa de churn" in result.stdout
+    assert "churn.training.train" not in _log(retrain.logs, "docker")
+    assert "/model/reload" not in _log(retrain.logs, "curl")
+
+
+def test_retrain_fallo_al_construir_el_dataset_sale_2(retrain):
+    result = retrain(labels="", labels_exit="1")  # docker/trainer caido: sin resumen JSON
+    assert result.returncode == 2
+    assert "(codigo 1): sin detalle" in result.stdout
+    assert "churn.training.train" not in _log(retrain.logs, "docker")
+
+
+def test_retrain_no_recarga_si_el_retador_de_las_etiquetas_no_se_promueve(retrain):
+    result = retrain(labels=LABELS_OK, labels_exit="0", docker_exit="3")
+    assert result.returncode == 0
+    assert "NO promovido" in result.stdout
+    assert "/model/reload" not in _log(retrain.logs, "curl")
 
 
 def test_retrain_con_fichero_inexistente_falla_con_claridad(retrain, tmp_path):

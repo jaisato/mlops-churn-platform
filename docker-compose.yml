@@ -27,7 +27,8 @@ services:
 
   trainer:
     build: .
-    # Entrenamiento inicial con datos sinteticos. Para reentrenar con otros datos:
+    # Entrenamiento inicial con datos sinteticos. Para reentrenar: `make retrain` (dataset
+    # construido con las etiquetas de POST /labels dentro del volumen) o
     # `make retrain DATA=data/churn-q3.csv` (monta el fichero y pasa `--data`).
     command: python -m churn.training.train --rows 20000 --model-dir /models
     environment:

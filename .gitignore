@@ -13,6 +13,8 @@ build/
 *.egg-info/
 data/local/
 data/*.csv
+data/*.parquet
+data/*.meta.json
 mlruns/
 models/
 .last_tag
