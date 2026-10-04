@@ -6,9 +6,10 @@ como enumeraciones en OpenAPI; un test de contrato comprueba que coinciden con
 `churn.data.generator`.
 """
 
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from churn.data.validation import RANGES
 
@@ -47,6 +48,11 @@ class CustomerFeatures(BaseModel):
 class PredictionResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
+    prediction_id: str = Field(
+        ...,
+        description="Identificador de esta prediccion: guardalo junto al cliente para "
+        "devolver despues su churn real en POST /labels",
+    )
     churn_probability: float = Field(..., ge=0.0, le=1.0)
     risk_level: RiskLevel
     model_version: str
@@ -58,6 +64,62 @@ class BatchPredictionRequest(BaseModel):
 
 class BatchPredictionResponse(BaseModel):
     predictions: list[PredictionResponse]
+
+
+class LabelIn(BaseModel):
+    """Churn real observado para una prediccion ya servida."""
+
+    prediction_id: str = Field(..., min_length=1, max_length=64)
+    churn: Literal[0, 1] = Field(..., description="1 si el cliente se dio de baja, 0 si no")
+    observed_at: datetime | None = Field(
+        None,
+        description="Cuando se observo el resultado (ISO-8601; naive = UTC). "
+        "Por defecto, el instante de recepcion",
+    )
+
+
+class LabelsRequest(BaseModel):
+    labels: list[LabelIn] = Field(..., min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def _ids_unicos(self) -> "LabelsRequest":
+        ids = [label.prediction_id for label in self.labels]
+        duplicated = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicated:
+            raise ValueError(f"prediction_id repetido en el lote: {duplicated}")
+        return self
+
+
+class LabelsResponse(BaseModel):
+    received: int
+    created: int = Field(..., description="Predicciones etiquetadas por primera vez")
+    updated: int = Field(..., description="Etiquetas que sobrescriben una anterior")
+    unknown: list[str] = Field(
+        ..., description="prediction_id que no estan (o ya no estan) en el almacen"
+    )
+    labelled_total: int = Field(..., description="Predicciones etiquetadas en total")
+
+
+class PerformanceBlock(BaseModel):
+    n: int
+    churn_rate: float
+    roc_auc: float | None = Field(None, description="None si la ventana solo tiene una clase")
+    accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    brier: float
+
+
+class PerformanceResponse(BaseModel):
+    serving_version: str | None = Field(None, description="Version cargada en este proceso")
+    holdout_roc_auc: float | None = Field(
+        None, description="AUC de la version en servicio sobre su holdout de entrenamiento"
+    )
+    labelled_total: int
+    threshold: float
+    overall: PerformanceBlock
+    by_version: dict[str, PerformanceBlock]
 
 
 class QualityGate(BaseModel):

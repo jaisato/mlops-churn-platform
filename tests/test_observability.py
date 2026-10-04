@@ -1,8 +1,8 @@
 import logging
 
-from churn.data.generator import FEATURE_COLUMNS, generate_dataset
+from churn.data.generator import FEATURE_COLUMNS, TARGET, generate_dataset
 from tests.conftest import ADMIN_HEADERS
-from tests.test_api import CUSTOMER, CUSTOMER_FIEL, _customers_from
+from tests.test_api import CUSTOMER, CUSTOMER_FIEL, _customers_from, _score_and_label
 
 # --------------------------------------------------------------------------- /metrics
 
@@ -55,6 +55,61 @@ def test_metrics_model_info_cambia_con_el_reload(client_factory, train_small):
     body = c.get("/metrics").text
     assert f'churn_model_info{{model_version="{v2}"}} 1.0' in body
     assert f'churn_model_info{{model_version="{v1}"}}' not in body  # la serie anterior se retira
+
+
+def test_metrics_de_etiquetas_cuentan_por_resultado(client):
+    a, b = (
+        client.post("/predict", json=c).json()["prediction_id"] for c in (CUSTOMER, CUSTOMER_FIEL)
+    )
+    lote = [{"prediction_id": a, "churn": 1}, {"prediction_id": b, "churn": 0}]
+    client.post(
+        "/labels",
+        json={"labels": lote + [{"prediction_id": "x", "churn": 1}]},
+        headers=ADMIN_HEADERS,
+    )
+    client.post("/labels", json={"labels": lote[:1]}, headers=ADMIN_HEADERS)  # correccion
+
+    body = client.get("/metrics").text
+    assert 'churn_labels_total{result="created"} 2.0' in body
+    assert 'churn_labels_total{result="updated"} 1.0' in body
+    assert 'churn_labels_total{result="unknown"} 1.0' in body
+    assert "churn_labels_stored 2.0" in body
+
+
+def test_metrics_de_etiquetas_almacenadas_se_publican_al_arrancar(client_factory):
+    primero, model_dir = client_factory(seed=109)
+    _score_and_label(primero, generate_dataset(3, seed=110))
+    reiniciado, _ = client_factory(model_dir=model_dir, train_model=False)
+    assert "churn_labels_stored 3.0" in reiniciado.get("/metrics").text  # sin esperar a un POST
+
+
+def test_metrics_de_rendimiento_por_version(client_factory, train_small):
+    c, model_dir = client_factory(seed=112)  # drift_min_rows=5
+    datos = generate_dataset(12, seed=113)
+    _score_and_label(c, datos.head(6))
+    v1 = c.get("/health").json()["model_version"]
+    assert "churn_performance_roc_auc" not in c.get("/metrics").text.split("# HELP")[0]
+    report = c.get("/monitoring/performance").json()
+    body = c.get("/metrics").text
+    assert f'churn_performance_labelled{{model_version="{v1}"}} 6.0' in body
+    assert (
+        f'churn_performance_recall{{model_version="{v1}"}} {report["by_version"][v1]["recall"]}'
+        in body
+    )
+    for name in ("roc_auc", "precision", "f1"):
+        assert f'churn_performance_{name}{{model_version="{v1}"}}' in body
+
+    train_small(model_dir, seed=114)
+    v2 = c.post("/model/reload", headers=ADMIN_HEADERS).json()["model_version"]
+    solo_bajas = datos.tail(6).copy()
+    solo_bajas[TARGET] = 1
+    _score_and_label(c, solo_bajas)
+    c.get("/monitoring/performance")
+    body = c.get("/metrics").text
+    assert f'churn_performance_labelled{{model_version="{v2}"}} 6.0' in body
+    assert f'churn_performance_recall{{model_version="{v2}"}}' in body
+    assert f'churn_performance_roc_auc{{model_version="{v2}"}}' not in body  # AUC indefinido
+    assert f'churn_performance_roc_auc{{model_version="{v1}"}}' in body
 
 
 def test_metrics_desactivables(client_factory):
@@ -121,12 +176,14 @@ def test_api_key_protege_scoring_info_y_drift(client_factory):
     assert c.get("/model/info").status_code == 401
     assert c.get("/model/versions").status_code == 401
     assert c.get("/monitoring/drift").status_code == 401
+    assert c.get("/monitoring/performance").status_code == 401
 
     ok = {"X-API-Key": "clave-secreta"}
     assert c.post("/predict", json=CUSTOMER, headers=ok).status_code == 200
     assert c.get("/model/info", headers=ok).status_code == 200
     assert c.get("/model/versions", headers=ok).status_code == 200
     assert c.get("/monitoring/drift", headers=ok).status_code == 409  # autenticado, sin datos
+    assert c.get("/monitoring/performance", headers=ok).status_code == 409
 
 
 def test_api_key_no_afecta_a_salud_metricas_ni_admin(client_factory):
@@ -135,6 +192,8 @@ def test_api_key_no_afecta_a_salud_metricas_ni_admin(client_factory):
     assert c.get("/health/live").status_code == 200
     assert c.get("/metrics").status_code == 200
     assert c.post("/model/reload", headers=ADMIN_HEADERS).status_code == 200
+    lote = {"labels": [{"prediction_id": "x", "churn": 1}]}
+    assert c.post("/labels", json=lote, headers=ADMIN_HEADERS).status_code == 200  # token admin
 
 
 def test_sin_api_key_configurada_los_endpoints_quedan_abiertos(client):

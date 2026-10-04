@@ -1,9 +1,14 @@
-"""API de scoring en tiempo real + monitorizacion de drift.
+"""API de scoring en tiempo real + monitorizacion de drift y de rendimiento real.
 
 Ademas de servir predicciones, la API guarda las features recibidas en produccion (y
 la probabilidad devuelta) en un almacen rodante y expone /monitoring/drift para
 compararlas contra la muestra de referencia del entrenamiento (PSI + KS) y contra
 la distribucion de puntuaciones del modelo (prediction drift).
+
+Bucle de etiquetas: cada prediccion devuelve un `prediction_id`; cuando el negocio conoce
+el churn real lo envia a POST /labels (X-Admin-Token) y la API lo guarda junto a la
+prediccion. Con esas etiquetas /monitoring/performance mide el acierto real del modelo y
+`python -m churn.data.labels` construye el dataset de reentreno.
 
 Operaciones de modelo (autenticadas con X-Admin-Token): /model/reload carga la
 version en servicio del almacen, /model/rollback vuelve a una version anterior.
@@ -19,6 +24,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -30,7 +36,14 @@ from churn import __version__
 from churn.config import Settings, get_settings
 from churn.logging_conf import configure_logging, request_id_var
 from churn.monitoring.drift import drift_report
-from churn.monitoring.store import PredictionStore, build_prediction_store
+from churn.monitoring.performance import DECISION_THRESHOLD, performance_report
+from churn.monitoring.store import (
+    ID_COLUMN,
+    LABEL_COLUMN,
+    OBSERVED_AT_COLUMN,
+    PredictionStore,
+    build_prediction_store,
+)
 from churn.registry import LoadedModel, LocalModelStore, verify_compatibility
 from churn.serving.metrics import CONTENT_TYPE_LATEST, Metrics
 from churn.serving.schemas import (
@@ -39,10 +52,13 @@ from churn.serving.schemas import (
     CustomerFeatures,
     DriftResponse,
     HealthResponse,
+    LabelsRequest,
+    LabelsResponse,
     LivenessResponse,
     ModelInfoResponse,
     ModelVersionInfo,
     ModelVersionsResponse,
+    PerformanceResponse,
     PredictionResponse,
     ReloadResponse,
     RiskLevel,
@@ -130,6 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.model_dir, keep_versions=settings.model_keep_versions
         )
         app.state.predictions = build_prediction_store(settings)
+        # El almacen sobrevive a los reinicios: la metrica no debe esperar al proximo POST /labels
+        metrics.set_labels_stored(app.state.predictions.labelled_count())
         _try_load_on_startup(app)
         yield
 
@@ -196,7 +214,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="Token de administracion invalido")
 
     def require_api_key(x_api_key: str = Header(default="")) -> None:
-        """Protege scoring, informacion del modelo y drift cuando CHURN_API_KEY esta definida."""
+        """Protege scoring, informacion del modelo y monitorizacion si hay CHURN_API_KEY."""
         if not settings.api_key:
             return
         if not secrets.compare_digest(x_api_key.encode(), settings.api_key.encode()):
@@ -213,17 +231,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rows = [c.model_dump() for c in customers]
         probas = [float(p) for p in model.pipeline.predict_proba(pd.DataFrame(rows))[:, 1]]
         store: PredictionStore = app.state.predictions
-        store.append(
+        # El almacen asigna el prediction_id: es la clave con la que volvera la etiqueta real
+        ids = store.append(
             {**row, "churn_probability": p, "model_version": model.version}
             for row, p in zip(rows, probas, strict=True)
         )
         predictions = []
-        for p in probas:
+        for prediction_id, p in zip(ids, probas, strict=True):
             risk = _risk(p)
             metrics.observe_prediction(risk, model.version, p)
             predictions.append(
                 PredictionResponse(
-                    churn_probability=round(p, 4), risk_level=risk, model_version=model.version
+                    prediction_id=prediction_id,
+                    churn_probability=round(p, 4),
+                    risk_level=risk,
+                    model_version=model.version,
                 )
             )
         return predictions
@@ -381,6 +403,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         metrics.observe_drift(report)
         return DriftResponse(model_version=model.version, **report)
+
+    # ------------------------------------------------------------------ bucle de etiquetas
+
+    @app.post("/labels", response_model=LabelsResponse, tags=["etiquetas"])
+    def labels(request: Request, body: LabelsRequest, x_admin_token: str = Header(default="")):
+        """Churn real de predicciones ya servidas (cabecera `X-Admin-Token`).
+
+        Idempotente por `prediction_id`: la ultima etiqueta recibida es la que vale, asi
+        que reenviar un lote deja el almacen igual (esas etiquetas cuentan como `updated`).
+        Los `prediction_id` que no estan (o ya no estan) en el almacen se devuelven en
+        `unknown` sin invalidar el resto del lote. `observed_at` ausente = instante de
+        recepcion.
+        """
+        _require_admin(x_admin_token)
+        received_at = datetime.now(UTC)
+        store: PredictionStore = request.app.state.predictions
+        outcome = store.label(
+            {
+                ID_COLUMN: label.prediction_id,
+                LABEL_COLUMN: label.churn,
+                OBSERVED_AT_COLUMN: label.observed_at or received_at,
+            }
+            for label in body.labels
+        )
+        stored = store.labelled_count()
+        metrics.observe_labels(outcome.created, outcome.updated, len(outcome.unknown), stored)
+        logger.info(
+            "Etiquetas recibidas: %s nuevas, %s corregidas, %s desconocidas; %s en total",
+            outcome.created,
+            outcome.updated,
+            len(outcome.unknown),
+            stored,
+        )
+        return LabelsResponse(
+            received=len(body.labels),
+            created=outcome.created,
+            updated=outcome.updated,
+            unknown=outcome.unknown,
+            labelled_total=stored,
+        )
+
+    @app.get(
+        "/monitoring/performance",
+        response_model=PerformanceResponse,
+        tags=["monitorizacion"],
+        dependencies=protected,
+    )
+    def monitoring_performance(request: Request):
+        """Acierto real sobre las predicciones etiquetadas mas recientes, en conjunto y por
+        version del modelo que las produjo. Mide lo que ya se sirvio, asi que no exige un
+        modelo cargado; 409 mientras no haya `CHURN_DRIFT_MIN_ROWS` predicciones etiquetadas.
+        """
+        store: PredictionStore = request.app.state.predictions
+        labelled = store.labelled(settings.drift_buffer_size)
+        if len(labelled) < settings.drift_min_rows:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Datos insuficientes para medir el rendimiento: {len(labelled)}/"
+                    f"{settings.drift_min_rows} predicciones etiquetadas"
+                ),
+            )
+        report = performance_report(labelled, DECISION_THRESHOLD)
+        metrics.observe_performance(report)
+        served = request.app.state.model
+        return PerformanceResponse(
+            serving_version=served.version if served else None,
+            holdout_roc_auc=served.metadata["metrics"].get("roc_auc") if served else None,
+            labelled_total=store.labelled_count(),
+            **report,
+        )
 
     return app
 

@@ -8,7 +8,10 @@ from churn.serving.schemas import (
     CustomerFeatures,
     DataSource,
     DriftResponse,
+    LabelIn,
+    LabelsRequest,
     ModelInfoResponse,
+    PerformanceResponse,
     PredictionResponse,
 )
 
@@ -43,10 +46,14 @@ def test_rechaza_tipos_incorrectos():
 
 
 def test_prediction_response_acota_la_probabilidad():
+    ok = dict(prediction_id="a" * 32, risk_level="alto", model_version="v")
+    PredictionResponse(churn_probability=0.2, **ok)
     with pytest.raises(ValidationError):
-        PredictionResponse(churn_probability=1.2, risk_level="alto", model_version="v")
+        PredictionResponse(churn_probability=1.2, **ok)
     with pytest.raises(ValidationError):
-        PredictionResponse(churn_probability=0.2, risk_level="extremo", model_version="v")
+        PredictionResponse(churn_probability=0.2, **{**ok, "risk_level": "extremo"})
+    with pytest.raises(ValidationError):  # sin prediction_id no se puede etiquetar despues
+        PredictionResponse(churn_probability=0.2, risk_level="alto", model_version="v")
 
 
 def test_model_info_tolera_metadata_antiguo_sin_campos_nuevos():
@@ -77,6 +84,50 @@ def test_drift_response_valida_estructura_de_features():
         )
 
 
+# --------------------------------------------------------------------------- etiquetas
+
+
+def _labels(*ids: str, churn: int = 1) -> dict:
+    return {"labels": [{"prediction_id": i, "churn": churn} for i in ids]}
+
+
+def test_labels_request_valido_y_observed_at_opcional():
+    body = LabelsRequest(**_labels("a", "b"))
+    assert [label.observed_at for label in body.labels] == [None, None]
+    con_fecha = LabelIn(prediction_id="a", churn=0, observed_at="2026-10-01T12:00:00+02:00")
+    assert con_fecha.observed_at is not None and con_fecha.observed_at.utcoffset() is not None
+
+
+def test_labels_request_rechaza_ids_repetidos():
+    with pytest.raises(ValidationError, match="repetido.*\\['a'\\]"):
+        LabelsRequest(**_labels("a", "b", "a"))
+
+
+def test_labels_request_acota_el_lote():
+    with pytest.raises(ValidationError):
+        LabelsRequest(labels=[])
+    with pytest.raises(ValidationError):
+        LabelsRequest(**_labels(*(f"id-{i}" for i in range(1001))))
+    assert len(LabelsRequest(**_labels(*(f"id-{i}" for i in range(1000)))).labels) == 1000
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        {"prediction_id": "a", "churn": 2},
+        {"prediction_id": "a", "churn": "si"},
+        {"prediction_id": "a", "churn": 0.5},
+        {"prediction_id": "", "churn": 1},
+        {"prediction_id": "a" * 65, "churn": 1},
+        {"churn": 1},
+        {"prediction_id": "a", "churn": 1, "observed_at": "ayer"},
+    ],
+)
+def test_label_invalida(label):
+    with pytest.raises(ValidationError):
+        LabelIn(**label)
+
+
 def test_data_source_admite_la_procedencia_de_etiquetas():
     source = DataSource(
         kind="labels",
@@ -91,3 +142,21 @@ def test_data_source_admite_la_procedencia_de_etiquetas():
     assert DataSource(kind="file", rows=1, fingerprint="f").labels is None
     with pytest.raises(ValidationError):
         DataSource(kind="crm", rows=1, fingerprint="f")
+
+
+def test_performance_response_admite_auc_indefinido():
+    block = {
+        "n": 3,
+        "churn_rate": 1.0,
+        "roc_auc": None,
+        "accuracy": 0.5,
+        "precision": 0.5,
+        "recall": 0.5,
+        "f1": 0.5,
+        "brier": 0.2,
+    }
+    resp = PerformanceResponse(
+        labelled_total=3, threshold=0.5, overall=block, by_version={"v1": block}
+    )
+    assert resp.serving_version is None and resp.holdout_roc_auc is None
+    assert resp.by_version["v1"].roc_auc is None
