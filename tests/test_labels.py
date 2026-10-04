@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -13,6 +14,7 @@ from churn.data.labels import (
     EXIT_ERROR,
     EXIT_INSUFFICIENT,
     EXIT_OK,
+    TRACE_COLUMNS,
     InsufficientLabelsError,
     LabelledWindow,
     labelled_dataset,
@@ -30,6 +32,7 @@ from churn.monitoring.store import MemoryPredictionStore, SqlitePredictionStore
 from tests.conftest import score_and_label
 
 OBSERVED = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+COLUMNS = FEATURE_COLUMNS + [TARGET] + TRACE_COLUMNS
 
 
 @pytest.fixture(params=["memory", "sqlite"])
@@ -56,9 +59,14 @@ def test_dataset_etiquetado_tiene_las_columnas_del_contrato_en_orden_de_predicci
 
     df, window = labelled_dataset(store)
 
-    assert list(df.columns) == FEATURE_COLUMNS + [TARGET]
-    pd.testing.assert_frame_equal(df, datos.reset_index(drop=True), check_dtype=False)
-    assert window.rows == 30
+    assert list(df.columns) == COLUMNS  # contrato + trazabilidad (no son features)
+    assert TRACE_COLUMNS == ["prediction_id", "subject_ref", "predicted_at", "observed_at"]
+    pd.testing.assert_frame_equal(
+        df[FEATURE_COLUMNS + [TARGET]], datos.reset_index(drop=True), check_dtype=False
+    )
+    assert df["prediction_id"].is_unique and df["subject_ref"].isna().all()
+    assert df["predicted_at"].is_monotonic_increasing
+    assert window.rows == 30 and window.labels_total == 30 and window.subjects == 0
     assert window.model_versions == ["v1", "v2"]
     assert window.churn_rate == round(float(datos[TARGET].mean()), 4)
     assert window.observed_from == "2026-10-01T12:00:00+00:00"
@@ -75,7 +83,7 @@ def test_write_escribe_dataset_y_sidecar_con_la_huella_del_fichero(store, tmp_pa
     summary = write_labelled_dataset(store, out, min_rows=500)
 
     df = load_training_data(out)
-    assert list(df.columns) == FEATURE_COLUMNS + [TARGET] and len(df) == 600
+    assert list(df.columns) == COLUMNS and len(df) == 600
     assert summary["kind"] == "labels"
     assert summary["path"] == str(out)
     assert summary["rows"] == 600
@@ -86,19 +94,20 @@ def test_write_escribe_dataset_y_sidecar_con_la_huella_del_fichero(store, tmp_pa
     assert sidecar == summary
     assert sidecar_path(out) == out.parent / f"labels{suffix}.meta.json"
 
-    # El trainer reconoce la procedencia a traves del sidecar
+    # El trainer reconoce la procedencia a traves del sidecar (kind sigue siendo "file")
     _, source = resolve_training_data(data_path=out)
-    assert source["kind"] == "labels"
+    assert source["kind"] == "file"
     assert source["labels"]["model_versions"] == ["v1"]
+    assert source["labels"]["labels_total"] == 600
     assert source["labels"]["observed_from"] == "2026-10-01T12:00:00+00:00"
 
 
 def test_write_rechaza_etiquetas_insuficientes_sin_escribir_nada(store, tmp_path):
     score_and_label(store, generate_dataset(120, seed=3))
     out = tmp_path / "labels.parquet"
-    with pytest.raises(InsufficientLabelsError, match="120 de un minimo de 500") as exc:
+    with pytest.raises(InsufficientLabelsError, match="120 ejemplos .* minimo de 500") as exc:
         write_labelled_dataset(store, out, min_rows=500)
-    assert (exc.value.rows, exc.value.min_rows) == (120, 500)
+    assert (exc.value.rows, exc.value.min_rows, exc.value.labels_total) == (120, 500, 120)
     assert not out.exists() and not sidecar_path(out).exists()
 
 
@@ -115,6 +124,100 @@ def test_write_rechaza_un_dataset_que_el_trainer_no_aceptaria(store, tmp_path):
 def test_write_rechaza_formatos_no_soportados(store, tmp_path):
     with pytest.raises(ValueError, match="Formato no soportado"):
         write_labelled_dataset(store, tmp_path / "labels.xlsx", min_rows=1)
+
+
+def _repeated_customers(store, customers, *, scorings: int, observed_at) -> pd.DataFrame:
+    """Puntua `scorings` veces a los mismos clientes (con `subject_ref`), un mes despues
+    cada vez, y etiqueta TODAS las predicciones con la misma observacion (su churn final)."""
+    snapshots = []
+    for month in range(scorings):
+        snap = customers.copy()
+        snap["tenure_months"] = (snap["tenure_months"] + month).clip(upper=120)
+        snap["subject_ref"] = [f"c-{i}" for i in range(len(customers))]
+        rows = snap[FEATURE_COLUMNS].to_dict("records")
+        ids = store.append(
+            {**row, "subject_ref": subject, "churn_probability": 0.5, "model_version": "v1"}
+            for row, subject in zip(rows, snap["subject_ref"], strict=True)
+        )
+        store.label(
+            {"prediction_id": i, "churn": int(c), "observed_at": observed_at}
+            for i, c in zip(ids, snap[TARGET], strict=True)
+        )
+        snapshots.append(snap.assign(prediction_id=ids))
+    return pd.concat(snapshots, ignore_index=True)
+
+
+def test_una_etiqueta_por_sujeto_y_horizonte(store):
+    clientes = generate_dataset(40, seed=11)
+    puntuados = _repeated_customers(store, clientes, scorings=3, observed_at=OBSERVED)
+
+    df, window = labelled_dataset(store)
+
+    # 120 etiquetas de 40 clientes con la misma observacion: un ejemplo por cliente, el de
+    # la prediccion mas reciente (la ultima puntuacion, con 2 meses mas de antiguedad)
+    assert (window.labels_total, window.rows, window.subjects) == (120, 40, 40)
+    ultima = puntuados.tail(40).reset_index(drop=True)
+    assert list(df["prediction_id"]) == list(ultima["prediction_id"])
+    assert list(df["tenure_months"]) == list(ultima["tenure_months"])
+    assert df["subject_ref"].is_unique
+
+    # Una observacion posterior (otro horizonte) del mismo cliente es otro ejemplo
+    [nueva] = store.append(
+        [
+            {
+                **clientes[FEATURE_COLUMNS].iloc[0].to_dict(),
+                "subject_ref": "c-0",
+                "churn_probability": 0.5,
+                "model_version": "v2",
+            }
+        ]
+    )
+    store.label([{"prediction_id": nueva, "churn": 1, "observed_at": "2026-12-01T00:00:00Z"}])
+    df, window = labelled_dataset(store)
+    assert (window.labels_total, window.rows, window.subjects) == (121, 41, 40)
+    assert list(df.loc[df["subject_ref"] == "c-0", "observed_at"]) == [
+        "2026-10-01T12:00:00+00:00",
+        "2026-12-01T00:00:00+00:00",
+    ]
+
+
+def test_sin_sujeto_solo_se_deduplican_las_filas_identicas(store):
+    datos = generate_dataset(10, seed=12)
+    score_and_label(store, datos, observed_at=OBSERVED)
+    score_and_label(store, datos.head(4), observed_at=OBSERVED)  # mismas filas, otra vez
+    otra = datos.head(1).copy()
+    otra[TARGET] = 1 - otra[TARGET]  # mismas features con otra etiqueta: no es un duplicado
+    score_and_label(store, otra, observed_at=OBSERVED)
+
+    df, window = labelled_dataset(store)
+
+    assert (window.labels_total, window.rows, window.subjects) == (15, 11, 0)
+    assert len(df.drop_duplicates(FEATURE_COLUMNS + [TARGET])) == 11
+
+
+def test_write_es_atomico_si_falla_conserva_el_dataset_anterior(store, tmp_path, monkeypatch):
+    score_and_label(store, generate_dataset(600, seed=13), observed_at=OBSERVED)
+    out = tmp_path / "datasets" / "labels.parquet"
+    primero = write_labelled_dataset(store, out, min_rows=500)
+    contenido, sidecar = out.read_bytes(), sidecar_path(out).read_text()
+    score_and_label(store, generate_dataset(50, seed=14), observed_at=OBSERVED)
+
+    def disco_lleno(self, path, *args, **kwargs):
+        Path(path).write_bytes(b"PAR1 a medias")
+        raise OSError("No queda espacio en el dispositivo")
+
+    with monkeypatch.context() as patch, pytest.raises(OSError, match="espacio"):
+        patch.setattr(pd.DataFrame, "to_parquet", disco_lleno)
+        write_labelled_dataset(store, out, min_rows=500)
+
+    assert out.read_bytes() == contenido and sidecar_path(out).read_text() == sidecar
+    assert sorted(f.name for f in out.parent.iterdir()) == [  # sin temporales a medias
+        "labels.parquet",
+        "labels.parquet.meta.json",
+    ]
+    segundo = write_labelled_dataset(store, out, min_rows=500)
+    assert segundo["rows"] == 650 and segundo["fingerprint"] != primero["fingerprint"]
+    assert read_sidecar(out)["fingerprint"] == dataset_fingerprint(load_training_data(out))
 
 
 def test_min_rows_por_debajo_del_validador_falla_en_la_validacion(store, tmp_path):
@@ -160,7 +263,12 @@ def test_cli_acepta_db_out_y_min_rows_explicitos(tmp_path, capsys):
     assert len(pd.read_csv(out)) == 700
 
     assert main([*argv[:-1], "750"]) == EXIT_INSUFFICIENT
-    assert _summary(capsys) == {"status": "insufficient", "rows": 700, "min_rows": 750}
+    assert _summary(capsys) == {
+        "status": "insufficient",
+        "rows": 700,
+        "labels_total": 700,
+        "min_rows": 750,
+    }
 
 
 def test_cli_etiquetas_insuficientes_devuelve_3(tmp_path, capsys):
@@ -169,7 +277,12 @@ def test_cli_etiquetas_insuficientes_devuelve_3(tmp_path, capsys):
 
     assert main(["--model-dir", str(model_dir)]) == EXIT_INSUFFICIENT
 
-    assert _summary(capsys) == {"status": "insufficient", "rows": 20, "min_rows": 500}
+    assert _summary(capsys) == {
+        "status": "insufficient",
+        "rows": 20,
+        "labels_total": 20,
+        "min_rows": 500,
+    }
     assert not (model_dir / "datasets").exists()
 
 
@@ -196,13 +309,13 @@ def test_cli_lee_los_valores_por_defecto_de_settings(tmp_path, monkeypatch, caps
         _env_file=None,
         model_dir=str(tmp_path / "ignorado"),
         drift_db_path=str(tmp_path / "configurado.sqlite"),
-        labels_min_rows=10,
+        labels_min_rows=600,
     )
     monkeypatch.setattr(labels_module, "get_settings", lambda: settings)
     store = SqlitePredictionStore(settings.drift_db_path, max_rows=settings.prediction_keep_rows)
-    score_and_label(store, generate_dataset(12, seed=10))
+    score_and_label(store, generate_dataset(550, seed=10))
 
-    assert main(["--out", str(tmp_path / "labels.csv")]) == EXIT_ERROR  # 12 >= 10 pero < 500
-    assert "demasiado pequeno" in _summary(capsys)["error"]
-    assert main(["--out", str(tmp_path / "labels.csv"), "--min-rows", "20"]) == EXIT_INSUFFICIENT
-    assert _summary(capsys)["min_rows"] == 20
+    assert main(["--out", str(tmp_path / "labels.csv")]) == EXIT_INSUFFICIENT  # 550 < 600
+    assert _summary(capsys)["min_rows"] == 600
+    assert main(["--out", str(tmp_path / "labels.csv"), "--min-rows", "500"]) == EXIT_OK
+    assert _summary(capsys)["path"] == str(tmp_path / "labels.csv")

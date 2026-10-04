@@ -70,6 +70,13 @@ def test_la_retencion_de_predicciones_cubre_la_ventana_de_drift(monkeypatch):
         Settings(_env_file=None, labels_min_rows=0)
 
 
+def test_labels_min_rows_no_baja_del_minimo_del_validador():
+    # por debajo de 500 el dataset se construiria y el trainer lo rechazaria despues
+    with pytest.raises(ValidationError, match="greater than or equal to 500"):
+        Settings(_env_file=None, labels_min_rows=499)
+    assert Settings(_env_file=None, labels_min_rows=500).labels_min_rows == 500
+
+
 def test_prediction_keep_days(monkeypatch):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, prediction_keep_days=-1)

@@ -171,6 +171,8 @@ def _sidecar(path, fingerprint: str) -> dict:
         "observed_to": "2026-10-03T00:00:00+00:00",
         "model_versions": ["v1", "v2"],
         "churn_rate": 0.27,
+        "labels_total": 640,
+        "subjects": 580,
     }
     sidecar_path(path).write_text(json.dumps(payload), encoding="utf-8")
     return payload
@@ -190,7 +192,7 @@ def test_resolve_con_sidecar_coincidente_describe_la_fuente_como_labels(tmp_path
 
     assert len(df) == 600
     assert source == {
-        "kind": "labels",
+        "kind": "file",  # no "labels": una imagen anterior no conoceria ese valor (rollback)
         "path": str(path),
         "rows": 600,
         "fingerprint": payload["fingerprint"],
@@ -203,6 +205,8 @@ def test_resolve_con_sidecar_coincidente_describe_la_fuente_como_labels(tmp_path
         "observed_from",
         "observed_to",
         "model_versions",
+        "labels_total",
+        "subjects",
     }
 
 
@@ -240,5 +244,5 @@ def test_sidecar_incompleto_rellena_la_ventana_con_nulos(tmp_path, sample):
 
     _, source = resolve_training_data(data_path=path)
 
-    assert source["kind"] == "labels"
+    assert source["kind"] == "file"
     assert source["labels"] == dict.fromkeys(LABELS_WINDOW_KEYS)

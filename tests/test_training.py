@@ -402,7 +402,7 @@ def test_cli_entrena_desde_el_dataset_de_etiquetas_y_registra_su_ventana(tmp_pat
 
     metadata = LocalModelStore(tmp_path / "models").load().metadata
     source = metadata["data_source"]
-    assert source["kind"] == "labels"
+    assert source["kind"] == "file"  # la procedencia de etiquetas va en el bloque `labels`
     assert source["path"] == summary["path"]
     assert source["rows"] == 900
     assert source["fingerprint"] == summary["fingerprint"]  # la huella del sidecar es la real
@@ -413,6 +413,8 @@ def test_cli_entrena_desde_el_dataset_de_etiquetas_y_registra_su_ventana(tmp_pat
         "observed_from": "2026-10-01T00:00:00+00:00",
         "observed_to": "2026-10-01T00:00:00+00:00",
         "model_versions": ["v-anterior"],
+        "labels_total": 900,
+        "subjects": 0,
     }
     assert ModelInfoResponse(**metadata).data_source.labels.model_versions == ["v-anterior"]
     assert "labels" in capsys.readouterr().out  # la procedencia queda en el log del trainer

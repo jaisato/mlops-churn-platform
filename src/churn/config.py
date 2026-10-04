@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from churn.data.validation import MIN_ROWS
+
 # Valores de token que NUNCA deben llegar a produccion (defaults y placeholders de ejemplo).
 INSECURE_ADMIN_TOKENS = frozenset(
     {"", "cambia-este-token", "genera-un-token-seguro", "token-local"}
@@ -66,9 +68,9 @@ class Settings(BaseSettings):
     prediction_keep_rows: int = Field(default=100_000, ge=2)
     # Antiguedad maxima de las predicciones en dias (0 = sin limite; solo cuenta keep_rows)
     prediction_keep_days: int = Field(default=0, ge=0)
-    # Minimo de predicciones etiquetadas para construir el dataset de reentreno
-    # (`python -m churn.data.labels`); el validador de entrenamiento exige ademas >= 500 filas
-    labels_min_rows: int = Field(default=500, ge=1)
+    # Minimo de ejemplos etiquetados (tras deduplicar) para construir el dataset de reentreno
+    # (`python -m churn.data.labels`); nunca por debajo del minimo del validador de entrenamiento
+    labels_min_rows: int = Field(default=MIN_ROWS, ge=MIN_ROWS)
 
     # Token para operaciones administrativas (/model/reload, /model/rollback)
     admin_token: str = "cambia-este-token"

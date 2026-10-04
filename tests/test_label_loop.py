@@ -9,14 +9,28 @@ sale.
 
 import json
 
-from churn.data.generator import DriftSpec, generate_dataset
+from churn.data.generator import TARGET, DriftSpec, generate_dataset
 from churn.data.labels import main as build_labels_dataset
 from churn.data.sources import read_sidecar
 from churn.training.train import main as train_main
 from tests.conftest import ADMIN_HEADERS
-from tests.test_api import _score_and_label
+from tests.test_api import _customers_from, _score_and_label
 
 DRIFT = DriftSpec.from_shift(1.0)
+
+
+def _score_and_label_subjects(client, df, offset: int) -> None:
+    """Como `_score_and_label`, pero el CRM envia la clave opaca de cada cliente."""
+    customers = [
+        {**c, "subject_ref": f"cli-{offset + i}"} for i, c in enumerate(_customers_from(df))
+    ]
+    predictions = client.post("/predict/batch", json={"customers": customers}).json()
+    labels = [
+        {"prediction_id": p["prediction_id"], "churn": int(churn)}
+        for p, churn in zip(predictions["predictions"], df[TARGET], strict=True)
+    ]
+    resp = client.post("/labels", json={"labels": labels}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200 and resp.json()["created"] == len(df), resp.text
 
 
 def test_bucle_de_etiquetas_de_extremo_a_extremo(client_factory, capsys):
@@ -25,9 +39,10 @@ def test_bucle_de_etiquetas_de_extremo_a_extremo(client_factory, capsys):
     holdout_auc = c.get("/model/info").json()["metrics"]["roc_auc"]
     world = generate_dataset(1500, seed=43, drift=DRIFT)  # el mundo ha cambiado
 
-    # 1. Se puntua el trafico nuevo y, semanas despues, llega su churn real (lotes <= 1000)
-    for chunk in (world.iloc[:1000], world.iloc[1000:]):
-        _score_and_label(c, chunk)
+    # 1. Se puntua el trafico nuevo y, semanas despues, llega su churn real (lotes <= 1000);
+    #    el CRM envia ademas la clave opaca de cada cliente (subject_ref)
+    _score_and_label_subjects(c, world.iloc[:1000], offset=0)
+    _score_and_label_subjects(c, world.iloc[1000:], offset=1000)
     assert c.get("/monitoring/drift").json()["drift_detected"] is True
     before = c.get("/monitoring/performance").json()
     assert before["labelled_total"] == 1500
@@ -39,6 +54,7 @@ def test_bucle_de_etiquetas_de_extremo_a_extremo(client_factory, capsys):
     assert build_labels_dataset(["--model-dir", model_dir]) == 0
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])  # como `tail -n 1`
     assert summary["rows"] == 1500 and summary["model_versions"] == [v1]
+    assert summary["subjects"] == 1500 and summary["labels_total"] == 1500
     assert read_sidecar(summary["path"])["fingerprint"] == summary["fingerprint"]
 
     # 3. Reentreno con --data: el retador gana al campeon sobre el holdout nuevo y se promueve
@@ -48,12 +64,13 @@ def test_bucle_de_etiquetas_de_extremo_a_extremo(client_factory, capsys):
     info = c.get("/model/info").json()
     assert info["promotion"]["decision"] == "promoted"
     assert info["promotion"]["champion_version"] == v1
-    assert info["data_source"]["kind"] == "labels"
+    assert info["data_source"]["kind"] == "file"  # compatible con imagenes anteriores
     assert info["data_source"]["rows"] == 1500
     assert info["data_source"]["fingerprint"] == summary["fingerprint"]
     assert info["data_source"]["labels"]["model_versions"] == [v1]
     assert info["data_source"]["labels"]["built_at"] == summary["built_at"]
     assert info["data_source"]["labels"]["predicted_to"] == summary["predicted_to"]
+    assert info["data_source"]["labels"]["subjects"] == 1500
 
     # 4. El modelo nuevo acierta mas en el mundo nuevo; el drift contra su referencia desaparece
     _score_and_label(c, generate_dataset(400, seed=44, drift=DRIFT))

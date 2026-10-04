@@ -209,16 +209,23 @@ class LabelsWindow(BaseModel):
     observed_from: str | None = None
     observed_to: str | None = None
     model_versions: list[str] = []
+    labels_total: int | None = Field(None, description="Etiquetas almacenadas antes de deduplicar")
+    subjects: int | None = Field(None, description="Sujetos distintos (`subject_ref`)")
 
 
 class DataSource(BaseModel):
-    kind: Literal["synthetic", "file", "labels", "dataframe"]
+    # Sin "labels": un dataset de etiquetas es un fichero (`kind = "file"`) con el bloque
+    # `labels`. Ampliar el Literal romperia /model/info al hacer rollback a una imagen anterior
+    # (su esquema no conoceria el valor); un campo nuevo, en cambio, simplemente se ignora.
+    kind: Literal["synthetic", "file", "dataframe"]
     rows: int
     fingerprint: str
     path: str | None = None
     seed: int | None = None
     drift_shift: float | None = None
-    labels: LabelsWindow | None = None
+    labels: LabelsWindow | None = Field(
+        None, description="Presente si el fichero se construyo desde las etiquetas de la API"
+    )
 
 
 class ModelInfoResponse(BaseModel):

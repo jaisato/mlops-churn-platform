@@ -136,18 +136,31 @@ def test_label_invalida(label):
 
 def test_data_source_admite_la_procedencia_de_etiquetas():
     source = DataSource(
-        kind="labels",
+        kind="file",
         rows=600,
         fingerprint="f" * 64,
         path="/models/datasets/labels.parquet",
-        labels={"predicted_from": "2026-09-01T00:00:00+00:00", "model_versions": ["v1"]},
+        labels={
+            "predicted_from": "2026-09-01T00:00:00+00:00",
+            "model_versions": ["v1"],
+            "labels_total": 640,
+            "subjects": 580,
+        },
     )
     assert source.labels is not None
     assert source.labels.model_versions == ["v1"]
+    assert (source.labels.labels_total, source.labels.subjects) == (640, 580)
     assert source.labels.observed_to is None
     assert DataSource(kind="file", rows=1, fingerprint="f").labels is None
     with pytest.raises(ValidationError):
         DataSource(kind="crm", rows=1, fingerprint="f")
+
+
+def test_data_source_no_amplia_kind_para_no_romper_el_rollback_de_imagen():
+    """La imagen anterior valida `kind` con Literal["synthetic", "file", "dataframe"]: un
+    valor nuevo romperia su /model/info tras un rollback. El bloque `labels` es aditivo."""
+    with pytest.raises(ValidationError):
+        DataSource(kind="labels", rows=1, fingerprint="f")
 
 
 def test_performance_response_admite_auc_indefinido():

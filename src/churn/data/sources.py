@@ -9,7 +9,8 @@ que un "reentrenamiento" con la misma huella y semilla no puede cambiar el model
 Un dataset construido desde las etiquetas de produccion (`churn.data.labels`) va
 acompanado de un fichero `<dataset>.meta.json` (sidecar) con su huella y su ventana
 temporal; si la huella coincide con el fichero cargado, esa informacion pasa al metadata
-del modelo (`data_source.kind = "labels"`) sin cambiar la interfaz `--data`.
+del modelo (bloque `data_source.labels`; `kind` sigue siendo `file`, el valor que entiende
+cualquier imagen anterior tras un rollback) sin cambiar la interfaz `--data`.
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ LABELS_WINDOW_KEYS = (
     "observed_from",
     "observed_to",
     "model_versions",
+    "labels_total",
+    "subjects",
 )
 
 
@@ -102,8 +105,8 @@ def resolve_training_data(
 
     - Con `data_path`: filas del fichero; `drift_shift` no se aplica (los datos reales
       ya traen su propio drift) y se rechaza si es distinto de cero para evitar confusion.
-      Si el fichero tiene un sidecar cuya huella coincide, la fuente es `labels` y lleva
-      la ventana temporal de las etiquetas.
+      Si el fichero tiene un sidecar cuya huella coincide, la fuente lleva ademas el
+      bloque `labels` con la ventana temporal de las etiquetas.
     - Sin `data_path`: generador sintetico con `rows`, `seed` y, opcionalmente, un
       escenario de drift (`DriftSpec.from_shift`).
     """
@@ -116,7 +119,6 @@ def resolve_training_data(
         sidecar = read_sidecar(data_path)
         if sidecar is not None:
             if sidecar.get("fingerprint") == fingerprint:
-                source["kind"] = "labels"
                 source["labels"] = {k: sidecar.get(k) for k in LABELS_WINDOW_KEYS}
             else:
                 logger.warning(
