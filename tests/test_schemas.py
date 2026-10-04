@@ -19,6 +19,7 @@ from churn.serving.schemas import (
     PerformanceResponse,
     PredictionRequest,
     PredictionResponse,
+    Promotion,
 )
 
 
@@ -222,3 +223,18 @@ def test_label_observed_at_no_puede_ser_futura():
 def test_labels_response_rejected_por_defecto_vacio():
     resp = LabelsResponse(received=1, created=1, updated=0, unknown=[], labelled_total=1)
     assert resp.rejected == []
+
+
+def test_promotion_admite_la_evidencia_de_la_comparacion_y_tolera_metadata_antiguo():
+    nueva = Promotion(
+        decision="promoted",
+        margin=0.0,
+        challenger_roc_auc=0.93,
+        evaluated_rows=300,
+        evaluated_groups=280,
+        champion_cutoff="2026-09-30T00:00:00+00:00",
+        reason="ok",
+    )
+    assert (nueva.evaluated_rows, nueva.evaluated_groups) == (300, 280)
+    antigua = Promotion(decision="no_champion", margin=0.0, challenger_roc_auc=0.9, reason="x")
+    assert antigua.evaluated_rows is None and antigua.champion_cutoff is None

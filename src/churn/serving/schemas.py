@@ -197,6 +197,17 @@ class Promotion(BaseModel):
     champion_version: str | None = None
     champion_roc_auc: float | None = None
     identical_training_data: bool = False
+    evaluated_rows: int | None = Field(
+        None,
+        description="Filas del holdout sobre las que se compararon campeon y retador: solo las "
+        "posteriores a las etiquetas con las que se entreno el campeon",
+    )
+    evaluated_groups: int | None = Field(
+        None, description="Grupos independientes (sujetos) en esas filas: la evidencia real"
+    )
+    champion_cutoff: str | None = Field(
+        None, description="`predicted_to` de las etiquetas del campeon (None si no salio de ellas)"
+    )
     reason: str
 
 
@@ -228,6 +239,16 @@ class DataSource(BaseModel):
     )
 
 
+class SplitInfo(BaseModel):
+    """Como se separo el holdout: por grupos (sujeto o filas identicas) y de forma estable."""
+
+    method: str
+    test_size: float
+    groups_train: int
+    groups_test: int
+    subject_rows: int = Field(..., description="Filas agrupadas por `subject_ref`")
+
+
 class ModelInfoResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -242,6 +263,7 @@ class ModelInfoResponse(BaseModel):
     quality_gate: QualityGate | None = None
     promotion: Promotion | None = None
     data_source: DataSource | None = None
+    split: SplitInfo | None = None
     runtime: dict[str, str] | None = None
     mlflow_run_id: str | None = None
     mlflow_model_version: str | None = None

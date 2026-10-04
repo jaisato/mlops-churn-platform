@@ -71,6 +71,7 @@ def test_bucle_de_etiquetas_de_extremo_a_extremo(client_factory, capsys):
     assert info["data_source"]["labels"]["built_at"] == summary["built_at"]
     assert info["data_source"]["labels"]["predicted_to"] == summary["predicted_to"]
     assert info["data_source"]["labels"]["subjects"] == 1500
+    assert info["split"]["subject_rows"] == 1500  # holdout separado por cliente
 
     # 4. El modelo nuevo acierta mas en el mundo nuevo; el drift contra su referencia desaparece
     _score_and_label(c, generate_dataset(400, seed=44, drift=DRIFT))
