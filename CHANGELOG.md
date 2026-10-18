@@ -31,9 +31,12 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/); vers
 
 ### Seguridad
 - `deploy.yml`: el tag del despliegue manual y los secretos llegan a los scripts por `env`, y el tag se valida (`latest`, `X.Y.Z[-pre]` o `sha-<hash>`) antes de viajar en el comando remoto de ssh. Antes se interpolaban con `${{ }}` dentro de `run:`, lo que permitia inyectar comandos en el runner y en el VPS a quien pudiera lanzar el workflow.
+- `X-Request-ID` del cliente solo se propaga (a la respuesta y a los logs) si es un identificador de 1-128 caracteres `[A-Za-z0-9._:-]`; cualquier otro valor se sustituye por uno generado, para que una cabecera de varios KB no infle cada linea de log.
+- `werkzeug` 3.1.8 -> 3.1.9 en los lockfiles (PYSEC-2026-4312).
 
 ### Corregido
 - `requirements.txt` vuelve a `pandas>=2.2,<3.0` y `mlflow>=2.22,<3.0`, las familias que fijan los lockfiles y el servidor MLflow de los compose. Dependabot los habia subido a 3.x sin regenerar los locks, y como la CI instala desde el lock, su verde no validaba los rangos declarados.
+- Lockfiles regenerados tras las subidas de Dependabot del 2026-10-17 (fastapi 0.143.5, pydantic 2.14.1, ruff 0.17.1, mypy 2.4.0, hypothesis 6.170.1): los rangos minimos de `requirements*.txt` ya no los cumplian los locks con los que instalan la CI y la imagen. `make coverage` exige el 100 % que exige la CI (decia 90).
 - Dependabot ignora las versiones mayores de las dependencias Python; se actualizan a mano con `make lock`.
 
 ## [1.2.0] - 2026-09-20

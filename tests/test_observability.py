@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from churn.data.generator import FEATURE_COLUMNS, TARGET, generate_dataset
 from tests.conftest import ADMIN_HEADERS
 from tests.test_api import CUSTOMER, CUSTOMER_FIEL, _customers_from, _score_and_label
@@ -129,6 +131,14 @@ def test_request_id_se_propaga_o_se_genera(client):
     assert propagado.headers["X-Request-ID"] == "abc-123"
     generado = client.get("/health")
     assert len(generado.headers["X-Request-ID"]) == 16
+
+
+@pytest.mark.parametrize("valor", ["x" * 129, "a b", "id;rm -rf", "ñ"])
+def test_request_id_no_valido_se_sustituye(client, valor):
+    respuesta = client.get("/health", headers={"X-Request-ID": valor.encode()})
+    devuelto = respuesta.headers["X-Request-ID"]
+    assert devuelto != valor
+    assert len(devuelto) == 16
 
 
 def test_access_log_es_una_linea_por_peticion_con_contexto(client, caplog):

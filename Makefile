@@ -29,7 +29,7 @@ test:
 	pytest -v
 
 coverage:           ## Tests con informe de cobertura (mismo umbral que CI)
-	pytest --cov=churn --cov-report=term-missing --cov-fail-under=90
+	pytest --cov=churn --cov-report=term-missing --cov-fail-under=100
 
 check: lint typecheck coverage   ## Todo lo que ejecuta el CI (salvo Docker)
 
