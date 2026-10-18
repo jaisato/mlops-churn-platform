@@ -21,6 +21,7 @@ como una linea JSON y alimenta las metricas Prometheus de /metrics.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -72,6 +73,11 @@ from churn.serving.schemas import (
 
 logger = logging.getLogger(__name__)
 access_logger = logging.getLogger("churn.access")
+
+# X-Request-ID del cliente: solo se propaga si es un identificador corto y "imprimible";
+# cualquier otra cosa (cabeceras de varios KB, espacios, caracteres de control) se sustituye
+# por uno generado para no inflar los logs ni reenviar al cliente lo que haya mandado.
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
 @dataclass(frozen=True)
@@ -194,7 +200,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def observability(request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or uuid4().hex[:16]
+        incoming = request.headers.get("x-request-id", "")
+        request_id = incoming if REQUEST_ID_PATTERN.fullmatch(incoming) else uuid4().hex[:16]
         token = request_id_var.set(request_id)
         started = time.perf_counter()
         try:
