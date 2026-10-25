@@ -21,7 +21,7 @@ cachecontrol==0.14.4
     # via pip-audit
 cachetools==5.5.2
     # via mlflow-skinny
-certifi==2026.7.22
+certifi==2026.10.23
     # via
     #   httpcore
     #   httpx
@@ -62,11 +62,11 @@ defusedxml==0.7.1
     # via py-serializable
 docker==7.2.0
     # via mlflow
-fastapi==0.143.5
+fastapi==0.162.0
     # via
     #   -r requirements.txt
     #   mlflow-skinny
-filelock==4.0.1
+filelock==4.2.4
     # via cachecontrol
 flask==3.1.3
     # via mlflow
@@ -74,7 +74,7 @@ fonttools==4.65.0
     # via matplotlib
 gitdb==4.0.12
     # via gitpython
-gitpython==3.1.62
+gitpython==3.2.1
     # via mlflow-skinny
 google-auth==2.58.0
     # via databricks-sdk
@@ -100,7 +100,7 @@ httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
     # via -r requirements-dev.txt
-hypothesis==6.170.1
+hypothesis==6.170.9
     # via -r requirements-dev.txt
 idna==3.20
     # via
@@ -184,15 +184,15 @@ numpy==2.5.3 ; python_full_version >= '3.12'
     #   pandas
     #   scikit-learn
     #   scipy
-opentelemetry-api==1.44.0
+opentelemetry-api==1.45.1
     # via
     #   fastapi
     #   mlflow-skinny
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.1
     # via mlflow-skinny
-opentelemetry-semantic-conventions==0.65b0
+opentelemetry-semantic-conventions==0.66b1
     # via opentelemetry-sdk
 packageurl-python==0.17.6
     # via cyclonedx-python-lib
@@ -210,7 +210,7 @@ pandas==2.3.3
     #   mlflow
 pathspec==1.1.1
     # via mypy
-pillow==12.3.0
+pillow==13.0.0
     # via matplotlib
 pip==26.2.1
     # via pip-api
@@ -252,7 +252,7 @@ pydantic==2.14.1
     #   pydantic-settings
 pydantic-core==2.50.1
     # via pydantic
-pydantic-settings==2.15.0
+pydantic-settings==2.16.1
     # via -r requirements.txt
 pygments==2.21.0
     # via
@@ -359,6 +359,7 @@ typing-extensions==4.16.0
     #   opentelemetry-semantic-conventions
     #   pydantic
     #   pydantic-core
+    #   pydantic-settings
     #   sqlalchemy
     #   starlette
     #   textual
