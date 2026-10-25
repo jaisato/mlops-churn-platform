@@ -33,6 +33,7 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/); vers
 - `deploy.yml`: el tag del despliegue manual y los secretos llegan a los scripts por `env`, y el tag se valida (`latest`, `X.Y.Z[-pre]` o `sha-<hash>`) antes de viajar en el comando remoto de ssh. Antes se interpolaban con `${{ }}` dentro de `run:`, lo que permitia inyectar comandos en el runner y en el VPS a quien pudiera lanzar el workflow.
 - `X-Request-ID` del cliente solo se propaga (a la respuesta y a los logs) si es un identificador de 1-128 caracteres `[A-Za-z0-9._:-]`; cualquier otro valor se sustituye por uno generado, para que una cabecera de varios KB no infle cada linea de log.
 - `werkzeug` 3.1.8 -> 3.1.9 en los lockfiles (PYSEC-2026-4312).
+- `deploy.yml` fija sus acciones por SHA (como ya hacia `ci.yml`) y el checkout no guarda el token: el job publica en GHCR con `packages: write` y una etiqueta movida en una accion de terceros ejecutaria codigo con ese permiso.
 - Lockfiles: `pillow` 12.3.0 -> 13.0.0 (via matplotlib; 37 avisos de pip-audit), `certifi` 2026.7.22 -> 2026.10.23, `gitpython` 3.1.62 -> 3.2.1, `opentelemetry-api`/`-sdk` 1.44.0 -> 1.45.1 y, en el de desarrollo, `filelock` 4.0.1 -> 4.2.4. Siguen abiertos los avisos de `mlflow` 2.22.5 y `pyarrow` 19.0.1 (que mlflow 2.x no deja subir): se corrigen en mlflow 3.x, una major que exige migrar cliente y servidor a la vez.
 
 ### Corregido
