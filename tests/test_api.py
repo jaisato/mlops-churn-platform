@@ -1,10 +1,15 @@
 import dataclasses
 import json
+import math
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
+import pandas as pd
+import pytest
+
 from churn.data.generator import FEATURE_COLUMNS, TARGET, generate_dataset
-from churn.registry import LocalModelStore
-from churn.serving.main import risk_level
+from churn.registry import LoadedModel, LocalModelStore
+from churn.serving.main import LOGIT_EPS, ServedModel, _explain_batch, _logit, risk_level
 from tests.conftest import ADMIN_HEADERS
 
 CUSTOMER = {
@@ -887,3 +892,104 @@ def test_linea_base_omite_columnas_sin_valores_validos(client):
     assert "monthly_charges" not in baseline
     assert "payment_method" not in baseline
     assert baseline["tenure_months"] == client.app.state.model.reference_baseline["tenure_months"]
+
+
+# --------------------------------------------------------------------------- explicaciones
+
+
+class _LogisticPipeline:
+    """Pipeline minimo: sigmoide de una combinacion lineal, para comprobar la aritmetica.
+
+    En log-odds el efecto de cambiar una feature es exactamente `peso * (valor - referencia)`,
+    independiente del resto de features: sin saturacion y con valores predecibles.
+    """
+
+    def __init__(self, weights: dict[str, float]):
+        self.weights = weights
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        z = sum(w * df[col].to_numpy(dtype=float) for col, w in self.weights.items())
+        p = 1.0 / (1.0 + np.exp(-z))
+        return np.column_stack([1.0 - p, p])
+
+
+class _HardPipeline:
+    """Clasificador duro: probabilidades 0.0 y 1.0 exactas (un arbol puro, por ejemplo)."""
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        p = (df["a"].to_numpy(dtype=float) > 0).astype(float)
+        return np.column_stack([1.0 - p, p])
+
+
+def _served(pipeline) -> ServedModel:
+    loaded = LoadedModel(
+        pipeline=pipeline,
+        metadata={
+            "model_version": "sintetico",
+            "numeric_features": ["a", "b"],
+            "categorical_features": [],
+        },
+        reference=pd.DataFrame({"a": [0.0, 0.0], "b": [0.0, 0.0]}),
+    )
+    import churn.serving.main as serving_main
+
+    return ServedModel(
+        loaded=loaded,
+        reference_scores=np.array([0.5, 0.5]),
+        reference_baseline=serving_main._reference_baseline(loaded),
+    )
+
+
+def test_logit_recortado_es_finito_simetrico_y_monotono():
+    assert _logit(0.5) == 0.0
+    assert _logit(0.9) == pytest.approx(math.log(9))
+    assert _logit(0.1) == pytest.approx(-math.log(9))
+    # 0.0 y 1.0 exactos (o valores fuera de rango) se recortan en lugar de romper el logaritmo
+    assert math.isfinite(_logit(0.0)) and math.isfinite(_logit(1.0))
+    assert _logit(0.0) == _logit(LOGIT_EPS) == _logit(-1.0)
+    assert _logit(1.0) == _logit(1.0 - LOGIT_EPS) == _logit(2.0)
+    assert _logit(0.0) == pytest.approx(-_logit(1.0))
+    assert _logit(0.0) < _logit(0.25) < _logit(0.5) < _logit(0.75) < _logit(1.0)
+
+
+def test_impacto_en_log_odds_no_se_satura_en_clientes_de_riesgo_extremo():
+    """El mismo factor vale lo mismo en un cliente con p = 0.9997 que en uno con p = 0.97.
+
+    En diferencia de probabilidad el factor `b` del cliente extremo quedaba en 0.002 (la
+    sigmoide ya esta plana) y en 0.15 en el moderado: el orden era ruido en los clientes de
+    riesgo alto, justo donde mas importa explicar.
+    """
+    pipeline = _LogisticPipeline({"a": 1.5, "b": 1.0})
+    model = _served(pipeline)
+    extremo = {"a": 4.0, "b": 2.0}  # logit 8.0 -> p = 0.99966
+    moderado = {"a": 1.0, "b": 2.0}  # logit 3.5 -> p = 0.97069
+    rows = [extremo, moderado]
+    probas = [float(p) for p in pipeline.predict_proba(pd.DataFrame(rows))[:, 1]]
+
+    factores = _explain_batch(model, rows, probas)
+
+    # impacto = peso * (valor - referencia): 1.5 * 4 = 6, 1.0 * 2 = 2; ordenados por |impacto|
+    assert [(f.feature, f.impact) for f in factores[0]] == [("a", 6.0), ("b", 2.0)]
+    assert [(f.feature, f.impact) for f in factores[1]] == [("b", 2.0), ("a", 1.5)]
+    assert all(
+        f.reference_value == 0.0 and f.value == rows[i][f.feature]
+        for i, fs in enumerate(factores)
+        for f in fs
+    )
+    # La misma ablacion medida en probabilidad se satura en el cliente extremo
+    cf_b = float(pipeline.predict_proba(pd.DataFrame([{**extremo, "b": 0.0}]))[:, 1][0])
+    assert probas[0] - cf_b < 0.01
+
+    # Un cliente por debajo de la referencia tiene impactos negativos de la misma magnitud
+    bajo = {"a": -4.0, "b": -2.0}  # logit -8.0
+    p_bajo = float(pipeline.predict_proba(pd.DataFrame([bajo]))[:, 1][0])
+    [negativos] = _explain_batch(model, [bajo], [p_bajo])
+    assert [(f.feature, f.impact) for f in negativos] == [("a", -6.0), ("b", -2.0)]
+
+
+def test_impacto_es_finito_con_probabilidades_exactas_de_0_y_1():
+    model = _served(_HardPipeline())
+    [factores] = _explain_batch(model, [{"a": 1.0, "b": 0.0}], [1.0])
+    assert [f.feature for f in factores] == ["a"]  # b coincide con la referencia: sin factor
+    assert math.isfinite(factores[0].impact)
+    assert factores[0].impact == pytest.approx(2 * _logit(1.0), abs=1e-4)

@@ -81,5 +81,5 @@ drift:              ## Informe de drift del trafico reciente
 performance:        ## Acierto real del modelo sobre las predicciones etiquetadas (AUC, precision, recall...)
 	curl -fsS http://localhost:8010/monitoring/performance | python -m json.tool
 
-predict-sample:     ## Prediccion de ejemplo con atribuciones locales contrafactuales (top_risk_factors)
+predict-sample:     ## Prediccion de ejemplo con atribuciones locales contrafactuales (top_risk_factors, impacto en log-odds)
 	curl -fsS -X POST http://localhost:8010/predict -H 'Content-Type: application/json' -d '{"tenure_months":3,"monthly_charges":95.5,"total_charges":280,"num_products":1,"support_tickets_90d":6,"is_fiber":0,"contract_type":"mensual","payment_method":"transferencia"}' | python -m json.tool
