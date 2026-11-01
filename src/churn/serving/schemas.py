@@ -76,16 +76,26 @@ class PredictionRequest(CustomerFeatures):
 
 
 class RiskFactor(BaseModel):
-    """Atribucion local de una feature por ablacion frente a la muestra de referencia."""
+    """Atribucion local de una feature por ablacion frente a la muestra de referencia.
+
+    `impact` se mide en log-odds: `logit(p_cliente) - logit(p_contrafactual)`, donde la
+    prediccion contrafactual pone solo esa feature al valor de referencia (mediana o moda
+    de la muestra de entrenamiento). Es el efecto marginal de una variable, asi que los
+    impactos de un cliente no suman la diferencia total; no se mide en probabilidad porque
+    esa diferencia se satura cerca de 0 y de 1 y deja de distinguir unos factores de otros.
+    """
 
     feature: str
     value: int | float | str
-    reference_value: int | float | str
+    reference_value: int | float | str = Field(
+        ..., description="Mediana (enteros redondeados) o moda de la feature en la referencia"
+    )
     impact: float = Field(
         ...,
         description=(
-            "Cambio en churn_probability atribuible al valor del cliente frente a la "
-            "referencia de entrenamiento (positivo = aumenta el riesgo de churn)"
+            "Impacto en log-odds: logit(p) - logit(p con esta feature en reference_value). "
+            "Efecto marginal de una variable frente a la referencia, no aditivo entre "
+            "factores (positivo = aumenta el riesgo de churn)"
         ),
     )
 
@@ -103,7 +113,11 @@ class PredictionResponse(BaseModel):
     model_version: str
     top_risk_factors: list[RiskFactor] = Field(
         default_factory=list,
-        description="Hasta 3 factores con mayor impacto absoluto sobre la probabilidad de churn",
+        description=(
+            "Hasta 3 features con mayor |impact| (en log-odds) frente a la referencia de "
+            "entrenamiento; vacio si el cliente coincide con la referencia o si las "
+            "explicaciones no se calcularon (lotes sin include_explanations o fallo interno)"
+        ),
     )
 
 

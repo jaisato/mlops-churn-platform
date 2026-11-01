@@ -21,6 +21,7 @@ como una linea JSON y alimenta las metricas Prometheus de /metrics.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import secrets
 import time
@@ -133,13 +134,30 @@ def _reference_baseline(loaded: LoadedModel) -> dict[str, int | float | str]:
     return baseline
 
 
+#: Recorte de la probabilidad antes del logit: un pipeline puede devolver 0.0 o 1.0 exactos.
+LOGIT_EPS = 1e-6
+
+
+def _logit(p: float) -> float:
+    """log(p / (1 - p)) con `p` recortada a [LOGIT_EPS, 1 - LOGIT_EPS] (finito siempre)."""
+    p = min(max(p, LOGIT_EPS), 1.0 - LOGIT_EPS)
+    return math.log(p / (1.0 - p))
+
+
 def _explain_batch(
     model: ServedModel,
     rows: list[dict[str, Any]],
     probas: list[float],
     top_k: int = 3,
 ) -> list[list[RiskFactor]]:
-    """Atribucion local vectorizada por ablacion frente a `model.reference_baseline`."""
+    """Atribucion local vectorizada por ablacion frente a `model.reference_baseline`.
+
+    El impacto de cada feature es la diferencia en **log-odds** entre la prediccion del
+    cliente y la del mismo cliente con esa feature puesta al valor de referencia (efecto
+    marginal de una variable, no aditivo). En probabilidad la diferencia se saturaba: con
+    p = 0.996 todos los impactos cabian en 0.05 y el orden era ruido, mientras que el
+    mismo factor valia 0.3 en un cliente con p = 0.3. Positivo = aumenta el riesgo.
+    """
     baseline = model.reference_baseline
     feature_cols = [c for c in model.loaded.feature_columns if c in baseline]
     cf_rows: list[dict[str, Any]] = []
@@ -156,7 +174,7 @@ def _explain_batch(
 
     cf_probas = model.pipeline.predict_proba(pd.DataFrame(cf_rows))[:, 1]
     for (idx, col), cf_p in zip(cf_index, cf_probas, strict=True):
-        impact = round(probas[idx] - float(cf_p), 4)
+        impact = round(_logit(probas[idx]) - _logit(float(cf_p)), 4)
         if impact == 0.0:
             continue
         by_customer[idx].append(
