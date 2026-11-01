@@ -111,16 +111,12 @@ def _reference_baseline(loaded: LoadedModel) -> dict[str, int | float | str]:
     baseline: dict[str, int | float | str] = {}
     ref = loaded.reference
     for col in loaded.metadata.get("numeric_features", []):
-        if col not in ref.columns:
-            continue
         median_val = float(ref[col].median())
         if pd.api.types.is_integer_dtype(ref[col]):
             baseline[col] = int(round(median_val))
         else:
             baseline[col] = round(median_val, 4)
     for col in loaded.metadata.get("categorical_features", []):
-        if col not in ref.columns:
-            continue
         modes = ref[col].mode(dropna=True)
         baseline[col] = str(modes.iloc[0]) if not modes.empty else str(ref[col].iloc[0])
     return baseline
@@ -333,9 +329,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> list[PredictionResponse]:
         rows = [c.features() for c in customers]  # subject_ref no es una feature
         probas = [float(p) for p in model.pipeline.predict_proba(pd.DataFrame(rows))[:, 1]]
-        explanations = (
-            _explain_batch(model, rows, probas) if explain else [[] for _ in customers]
-        )
+        explanations = _explain_batch(model, rows, probas) if explain else [[] for _ in customers]
         store: PredictionStore = app.state.predictions
         # El almacen asigna el prediction_id: es la clave con la que volvera la etiqueta real
         ids = store.append(
@@ -479,9 +473,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def predict_batch(request: Request, body: BatchPredictionRequest):
         return BatchPredictionResponse(
-            predictions=_score(
-                _model(request), body.customers, explain=body.include_explanations
-            )
+            predictions=_score(_model(request), body.customers, explain=body.include_explanations)
         )
 
     # ------------------------------------------------------------------ monitorizacion
