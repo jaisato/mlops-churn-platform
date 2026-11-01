@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -856,3 +857,33 @@ def test_produccion_avisa_si_labels_no_tiene_token_propio(tmp_path, caplog):
 
     assert "CHURN_LABELS_TOKEN no definido" in arrancar()
     assert "CHURN_LABELS_TOKEN no definido" not in arrancar(labels_token="b" * 32)
+
+
+def test_un_fallo_de_las_explicaciones_no_tumba_la_prediccion(client, monkeypatch, caplog):
+    import churn.serving.main as serving_main
+
+    def revienta(*_args, **_kwargs):
+        raise ValueError("pipeline no admite la fila contrafactual")
+
+    esperado = client.post("/predict", json=CUSTOMER).json()
+    monkeypatch.setattr(serving_main, "_explain_batch", revienta)
+    with caplog.at_level("ERROR", logger="churn"):
+        r = client.post("/predict", json=CUSTOMER)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["top_risk_factors"] == []
+    assert body["churn_probability"] == esperado["churn_probability"]
+    assert "explicaciones" in caplog.text
+
+
+def test_linea_base_omite_columnas_sin_valores_validos(client):
+    import churn.serving.main as serving_main
+
+    loaded = client.app.state.model.loaded
+    reference = loaded.reference.copy()
+    reference["monthly_charges"] = float("nan")
+    reference["payment_method"] = None
+    baseline = serving_main._reference_baseline(dataclasses.replace(loaded, reference=reference))
+    assert "monthly_charges" not in baseline
+    assert "payment_method" not in baseline
+    assert baseline["tenure_months"] == client.app.state.model.reference_baseline["tenure_months"]
