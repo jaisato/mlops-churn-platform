@@ -66,6 +66,7 @@ from churn.serving.schemas import (
     PredictionRequest,
     PredictionResponse,
     ReloadResponse,
+    RiskFactor,
     RiskLevel,
     RollbackRequest,
     RollbackResponse,
@@ -82,10 +83,11 @@ REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 @dataclass(frozen=True)
 class ServedModel:
-    """Modelo cargado + puntuaciones de referencia precalculadas (prediction drift)."""
+    """Modelo cargado + puntuaciones y linea base de referencia precalculadas."""
 
     loaded: LoadedModel
     reference_scores: np.ndarray
+    reference_baseline: dict[str, int | float | str]
 
     @property
     def pipeline(self) -> Any:
@@ -102,6 +104,62 @@ class ServedModel:
     @property
     def version(self) -> str:
         return self.loaded.version
+
+
+def _reference_baseline(loaded: LoadedModel) -> dict[str, int | float | str]:
+    """Valores tipicos por feature en la muestra de referencia (mediana o moda)."""
+    baseline: dict[str, int | float | str] = {}
+    ref = loaded.reference
+    for col in loaded.metadata.get("numeric_features", []):
+        median_val = float(ref[col].median())
+        if pd.api.types.is_integer_dtype(ref[col]):
+            baseline[col] = int(round(median_val))
+        else:
+            baseline[col] = round(median_val, 4)
+    for col in loaded.metadata.get("categorical_features", []):
+        modes = ref[col].mode(dropna=True)
+        baseline[col] = str(modes.iloc[0]) if not modes.empty else str(ref[col].iloc[0])
+    return baseline
+
+
+def _explain_batch(
+    model: ServedModel,
+    rows: list[dict[str, Any]],
+    probas: list[float],
+    top_k: int = 3,
+) -> list[list[RiskFactor]]:
+    """Atribucion local vectorizada por ablacion frente a `model.reference_baseline`."""
+    baseline = model.reference_baseline
+    feature_cols = [c for c in model.loaded.feature_columns if c in baseline]
+    cf_rows: list[dict[str, Any]] = []
+    cf_index: list[tuple[int, str]] = []
+    for idx, row in enumerate(rows):
+        for col in feature_cols:
+            if row.get(col) != baseline[col]:
+                cf_rows.append({**row, col: baseline[col]})
+                cf_index.append((idx, col))
+
+    by_customer: list[list[RiskFactor]] = [[] for _ in rows]
+    if not cf_rows:
+        return by_customer
+
+    cf_probas = model.pipeline.predict_proba(pd.DataFrame(cf_rows))[:, 1]
+    for (idx, col), cf_p in zip(cf_index, cf_probas, strict=True):
+        impact = round(probas[idx] - float(cf_p), 4)
+        if impact == 0.0:
+            continue
+        by_customer[idx].append(
+            RiskFactor(
+                feature=col,
+                value=rows[idx][col],
+                reference_value=baseline[col],
+                impact=impact,
+            )
+        )
+    for idx, factors in enumerate(by_customer):
+        factors.sort(key=lambda f: (-abs(f.impact), f.feature))
+        by_customer[idx] = factors[:top_k]
+    return by_customer
 
 
 def risk_level(probability: float, medium: float, high: float) -> RiskLevel:
@@ -123,7 +181,11 @@ def _load_model(app: FastAPI, version: str | None = None) -> ServedModel:
     ):
         logger.warning("Compatibilidad del modelo %s: %s", loaded.version, warning)
     scores = loaded.pipeline.predict_proba(loaded.reference[loaded.feature_columns])[:, 1]
-    served = ServedModel(loaded=loaded, reference_scores=np.asarray(scores, dtype=float))
+    served = ServedModel(
+        loaded=loaded,
+        reference_scores=np.asarray(scores, dtype=float),
+        reference_baseline=_reference_baseline(loaded),
+    )
     app.state.model = served  # asignacion atomica: las peticiones en vuelo ven el viejo o el nuevo
     app.state.metrics.set_model(served.version)
     return served
@@ -259,9 +321,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def _risk(p: float) -> RiskLevel:
         return risk_level(p, settings.risk_medium, settings.risk_high)
 
-    def _score(model: ServedModel, customers: list[PredictionRequest]) -> list[PredictionResponse]:
+    def _score(
+        model: ServedModel,
+        customers: list[PredictionRequest],
+        *,
+        explain: bool = True,
+    ) -> list[PredictionResponse]:
         rows = [c.features() for c in customers]  # subject_ref no es una feature
         probas = [float(p) for p in model.pipeline.predict_proba(pd.DataFrame(rows))[:, 1]]
+        explanations = _explain_batch(model, rows, probas) if explain else [[] for _ in customers]
         store: PredictionStore = app.state.predictions
         # El almacen asigna el prediction_id: es la clave con la que volvera la etiqueta real
         ids = store.append(
@@ -274,7 +342,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for row, p, customer in zip(rows, probas, customers, strict=True)
         )
         predictions = []
-        for prediction_id, p in zip(ids, probas, strict=True):
+        for prediction_id, p, factors in zip(ids, probas, explanations, strict=True):
             risk = _risk(p)
             metrics.observe_prediction(risk, model.version, p)
             predictions.append(
@@ -283,6 +351,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     churn_probability=round(p, 4),
                     risk_level=risk,
                     model_version=model.version,
+                    top_risk_factors=factors,
                 )
             )
         return predictions
@@ -403,7 +472,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dependencies=protected,
     )
     def predict_batch(request: Request, body: BatchPredictionRequest):
-        return BatchPredictionResponse(predictions=_score(_model(request), body.customers))
+        return BatchPredictionResponse(
+            predictions=_score(_model(request), body.customers, explain=body.include_explanations)
+        )
 
     # ------------------------------------------------------------------ monitorizacion
 

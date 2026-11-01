@@ -75,6 +75,21 @@ class PredictionRequest(CustomerFeatures):
         return self.model_dump(exclude={"subject_ref"})
 
 
+class RiskFactor(BaseModel):
+    """Atribucion local de una feature por ablacion frente a la muestra de referencia."""
+
+    feature: str
+    value: int | float | str
+    reference_value: int | float | str
+    impact: float = Field(
+        ...,
+        description=(
+            "Cambio en churn_probability atribuible al valor del cliente frente a la "
+            "referencia de entrenamiento (positivo = aumenta el riesgo de churn)"
+        ),
+    )
+
+
 class PredictionResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -86,10 +101,21 @@ class PredictionResponse(BaseModel):
     churn_probability: float = Field(..., ge=0.0, le=1.0)
     risk_level: RiskLevel
     model_version: str
+    top_risk_factors: list[RiskFactor] = Field(
+        default_factory=list,
+        description="Hasta 3 factores con mayor impacto absoluto sobre la probabilidad de churn",
+    )
 
 
 class BatchPredictionRequest(BaseModel):
     customers: list[PredictionRequest] = Field(..., min_length=1, max_length=1000)
+    include_explanations: bool = Field(
+        default=False,
+        description=(
+            "Si es True, calcula `top_risk_factors` para cada cliente del lote (por defecto "
+            "solo se calculan en POST /predict individual para no penalizar lotes masivos)"
+        ),
+    )
 
 
 class BatchPredictionResponse(BaseModel):

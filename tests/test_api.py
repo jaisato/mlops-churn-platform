@@ -93,6 +93,32 @@ def test_predict_riesgo_coherente(client):
     assert bajo["risk_level"] == "bajo"
 
 
+def test_predict_incluye_top_risk_factors_ordenados(client):
+    alto = client.post("/predict", json=CUSTOMER).json()
+    factors = alto["top_risk_factors"]
+    assert 1 <= len(factors) <= 3
+    impacts = [abs(f["impact"]) for f in factors]
+    assert impacts == sorted(impacts, reverse=True)
+    assert any(f["impact"] > 0 for f in factors)
+    for factor in factors:
+        assert factor["feature"] in FEATURE_COLUMNS
+        assert factor["value"] == CUSTOMER[factor["feature"]]
+        assert factor["reference_value"] != factor["value"]
+
+    # Un cliente identico a la linea base de referencia no tiene desviaciones que explicar
+    baseline = dict(client.app.state.model.reference_baseline)
+    neutro = client.post("/predict", json=baseline).json()
+    assert neutro["top_risk_factors"] == []
+
+    # En /predict/batch las explicaciones son opt-in (include_explanations=True)
+    batch_rapido = client.post("/predict/batch", json={"customers": [CUSTOMER]}).json()
+    assert batch_rapido["predictions"][0]["top_risk_factors"] == []
+    batch_explicado = client.post(
+        "/predict/batch", json={"customers": [CUSTOMER], "include_explanations": True}
+    ).json()
+    assert batch_explicado["predictions"][0]["top_risk_factors"] == factors
+
+
 def test_predict_validacion(client):
     invalido = dict(CUSTOMER, contract_type="semanal")
     assert client.post("/predict", json=invalido).status_code == 422
