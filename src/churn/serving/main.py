@@ -107,18 +107,29 @@ class ServedModel:
 
 
 def _reference_baseline(loaded: LoadedModel) -> dict[str, int | float | str]:
-    """Valores tipicos por feature en la muestra de referencia (mediana o moda)."""
+    """Valores tipicos por feature en la muestra de referencia (mediana o moda).
+
+    Una columna sin valores validos en la referencia (todo NaN) se queda fuera de la
+    linea base y por tanto de las explicaciones: antes una mediana NaN entraba como
+    valor contrafactual (cada /predict lo enviaba al pipeline, que con NaN puede
+    fallar) y una moda vacia caia a ``str(iloc[0])``, es decir la categoria ``"nan"``.
+    """
     baseline: dict[str, int | float | str] = {}
     ref = loaded.reference
     for col in loaded.metadata.get("numeric_features", []):
-        median_val = float(ref[col].median())
+        values = pd.to_numeric(ref[col], errors="coerce")
+        values = values[np.isfinite(values)]
+        if values.empty:
+            continue
+        median_val = float(values.median())
         if pd.api.types.is_integer_dtype(ref[col]):
             baseline[col] = int(round(median_val))
         else:
             baseline[col] = round(median_val, 4)
     for col in loaded.metadata.get("categorical_features", []):
         modes = ref[col].mode(dropna=True)
-        baseline[col] = str(modes.iloc[0]) if not modes.empty else str(ref[col].iloc[0])
+        if not modes.empty:
+            baseline[col] = str(modes.iloc[0])
     return baseline
 
 
@@ -321,6 +332,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def _risk(p: float) -> RiskLevel:
         return risk_level(p, settings.risk_medium, settings.risk_high)
 
+    def _explanations(
+        model: ServedModel, rows: list[dict[str, Any]], probas: list[float]
+    ) -> list[list[RiskFactor]]:
+        """Explicaciones de mejor esfuerzo: un fallo aqui no tumba una prediccion valida.
+
+        La atribucion vuelve a llamar al pipeline con filas contrafactuales; si eso falla
+        (un modelo recargado que no admite algun valor de la linea base, por ejemplo), antes
+        el `/predict` entero respondia 500 sin guardar la prediccion ya calculada.
+        """
+        try:
+            return _explain_batch(model, rows, probas)
+        except Exception:
+            logger.exception(
+                "No se pudieron calcular las explicaciones del modelo %s; se devuelven vacias",
+                model.version,
+            )
+            return [[] for _ in rows]
+
     def _score(
         model: ServedModel,
         customers: list[PredictionRequest],
@@ -329,7 +358,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> list[PredictionResponse]:
         rows = [c.features() for c in customers]  # subject_ref no es una feature
         probas = [float(p) for p in model.pipeline.predict_proba(pd.DataFrame(rows))[:, 1]]
-        explanations = _explain_batch(model, rows, probas) if explain else [[] for _ in customers]
+        explanations = _explanations(model, rows, probas) if explain else [[] for _ in customers]
         store: PredictionStore = app.state.predictions
         # El almacen asigna el prediction_id: es la clave con la que volvera la etiqueta real
         ids = store.append(
