@@ -11,7 +11,7 @@ anyio==4.15.1
     #   httpx
     #   starlette
     #   watchfiles
-ast-serialize==0.11.2
+ast-serialize==0.13.1
     # via mypy
 blinker==1.9.0
     # via flask
@@ -156,11 +156,11 @@ mlflow==2.22.5
     # via -r requirements.txt
 mlflow-skinny==2.22.5
     # via mlflow
-msgpack==1.2.2
+msgpack==1.2.4
     # via cachecontrol
-mutmut==3.8.0
+mutmut==3.8.1
     # via -r requirements-dev.txt
-mypy==2.4.0
+mypy==2.4.1
     # via -r requirements-dev.txt
 mypy-extensions==1.1.0
     # via mypy
@@ -244,15 +244,15 @@ pyasn1-modules==0.4.2
     # via google-auth
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
-pydantic==2.14.1
+pydantic==2.14.3
     # via
     #   -r requirements.txt
     #   fastapi
     #   mlflow-skinny
     #   pydantic-settings
-pydantic-core==2.50.1
+pydantic-core==2.50.4
     # via pydantic
-pydantic-settings==2.16.1
+pydantic-settings==2.16.2
     # via -r requirements.txt
 pygments==2.21.0
     # via

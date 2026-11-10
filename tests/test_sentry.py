@@ -63,3 +63,23 @@ def test_sdk_initialization_error_is_not_reported_as_success(monkeypatch) -> Non
 
     with pytest.raises(ValueError, match="invalid DSN"):
         maybe_init_sentry("invalid")
+
+
+def test_dsn_with_sdk_initializes_without_tracing_or_pii(monkeypatch) -> None:
+    # sentry-sdk no esta en los lockfiles: sin un SDK de mentira, la rama que lo
+    # inicializa no se ejecutaba en ningun test (cobertura al 99,90 %).
+    import sys
+    import types
+
+    calls: list[dict] = []
+    monkeypatch.setitem(
+        sys.modules, "sentry_sdk", types.SimpleNamespace(init=lambda **kw: calls.append(kw))
+    )
+    assert maybe_init_sentry(" http://public@glitchtip.local/1 ") is True
+    assert calls == [
+        {
+            "dsn": "http://public@glitchtip.local/1",
+            "traces_sample_rate": 0.0,
+            "send_default_pii": False,
+        }
+    ]

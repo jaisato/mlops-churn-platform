@@ -37,12 +37,14 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/); vers
 - `X-Request-ID` del cliente solo se propaga (a la respuesta y a los logs) si es un identificador de 1-128 caracteres `[A-Za-z0-9._:-]`; cualquier otro valor se sustituye por uno generado, para que una cabecera de varios KB no infle cada linea de log.
 - `werkzeug` 3.1.8 -> 3.1.9 en los lockfiles (PYSEC-2026-4312).
 - `deploy.yml` fija sus acciones por SHA (como ya hacia `ci.yml`) y el checkout no guarda el token: el job publica en GHCR con `packages: write` y una etiqueta movida en una accion de terceros ejecutaria codigo con ese permiso.
+- `msgpack` 1.2.2 -> 1.2.4 en el lockfile de desarrollo (CVE-2026-114613, via `cachecontrol`/`pip-audit`).
 - Lockfiles: `pillow` 12.3.0 -> 13.0.0 (via matplotlib; 37 avisos de pip-audit), `certifi` 2026.7.22 -> 2026.10.23, `gitpython` 3.1.62 -> 3.2.1, `opentelemetry-api`/`-sdk` 1.44.0 -> 1.45.1 y, en el de desarrollo, `filelock` 4.0.1 -> 4.2.4. Siguen abiertos los avisos de `mlflow` 2.22.5 y `pyarrow` 19.0.1 (que mlflow 2.x no deja subir): se corrigen en mlflow 3.x, una major que exige migrar cliente y servidor a la vez.
 
 ### Corregido
 - `requirements.txt` vuelve a `pandas>=2.2,<3.0` y `mlflow>=2.22,<3.0`, las familias que fijan los lockfiles y el servidor MLflow de los compose. Dependabot los habia subido a 3.x sin regenerar los locks, y como la CI instala desde el lock, su verde no validaba los rangos declarados.
 - Lockfiles regenerados tras las subidas de Dependabot del 2026-10-17 (fastapi 0.143.5, pydantic 2.14.1, ruff 0.17.1, mypy 2.4.0, hypothesis 6.170.1): los rangos minimos de `requirements*.txt` ya no los cumplian los locks con los que instalan la CI y la imagen. `make coverage` exige el 100 % que exige la CI (decia 90).
 - Dependabot ignora las versiones mayores de las dependencias Python; se actualizan a mano con `make lock`.
+- Lockfiles regenerados tras las subidas de Dependabot #47-#51: `pydantic` 2.14.1 y `pydantic-settings` 2.16.1 (en los dos locks), `mutmut` 3.8.0 y `mypy` 2.4.0 (en el de desarrollo) estaban por debajo de los suelos que ya declaraban `requirements*.txt`. Ahora `pydantic` 2.14.3 (`pydantic-core` 2.50.4), `pydantic-settings` 2.16.2, `mutmut` 3.8.1 y `mypy` 2.4.1, sin mover nada mas (`uv pip compile --upgrade-package`). Nuevo `tests/test_lockfiles.py`: comprueba sin red que cada pin de los lockfiles cumple el rango declarado, asi que la proxima subida de un suelo sin `make lock` rompe la CI en vez de pasar en verde.
 - Lockfiles regenerados tras las subidas de Dependabot del 2026-10-25 (fastapi 0.162.0, pydantic-settings 2.16.1, hypothesis 6.170.9): los locks seguian en fastapi 0.143.5 y pydantic-settings 2.15.0, por debajo de los minimos de `requirements*.txt`.
 
 ## [1.2.0] - 2026-09-20
