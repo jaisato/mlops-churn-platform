@@ -51,6 +51,7 @@ from churn.monitoring.store import (
     build_prediction_store,
 )
 from churn.registry import LoadedModel, LocalModelStore, verify_compatibility
+from churn.sentry import maybe_init_sentry
 from churn.serving.metrics import CONTENT_TYPE_LATEST, Metrics
 from churn.serving.schemas import (
     BatchPredictionRequest,
@@ -241,6 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        maybe_init_sentry()
         app.state.settings = settings
         app.state.metrics = metrics
         app.state.store = LocalModelStore(
