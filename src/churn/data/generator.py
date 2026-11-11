@@ -120,7 +120,10 @@ def generate_dataset(
 
     if not spec.is_null:
         tenure = np.clip(tenure - int(round(spec.tenure_shift)), 1, 120)
-        monthly = np.round(np.clip(monthly + spec.monthly_charges_shift, 0, 500), 2)
+        # `.round(2)` y no `np.round(np.clip(...), 2)`, que es la misma operacion: con
+        # los stubs de numpy 2.4 (los de Python 3.11) mypy resuelve la llamada anidada
+        # como float16 y da por incompatible la asignacion.
+        monthly = np.clip(monthly + spec.monthly_charges_shift, 0, 500).round(2)
     total = np.round(monthly * tenure * total_factor, 2)
 
     # Modelo latente: menos antiguedad, mas tickets, contrato mensual y cuota alta -> mas churn
