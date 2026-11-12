@@ -37,5 +37,17 @@ warn_unused_ignores = true
 
 [tool.mutmut]
 # Mutation testing sobre los modulos puros (sin entrenar modelos): `make mutation`
-paths_to_mutate = ["src/churn/monitoring/", "src/churn/data/"]
-tests_dir = ["tests/"]
+source_paths = ["src"]
+only_mutate = ["src/churn/monitoring/*", "src/churn/data/*"]
+process_isolation = "forkserver"
+log_to_file = true
+pytest_add_cli_args_test_selection = [
+    "tests/test_drift.py",
+    "tests/test_drift_properties.py",
+    "tests/test_generator.py",
+    "tests/test_labels.py",
+    "tests/test_performance.py",
+    "tests/test_prediction_store.py",
+    "tests/test_sources.py",
+    "tests/test_validation.py",
+]

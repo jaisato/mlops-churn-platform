@@ -37,7 +37,7 @@ audit:              ## Vulnerabilidades conocidas en las dependencias de producc
 	pip-audit -r requirements.lock
 
 mutation:           ## Mutation testing de los modulos puros (lento; ver [tool.mutmut])
-	mutmut run
+	OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 mutmut run
 
 train:              ## Entrena en local (sin Docker) y deja artefactos en ./models (DATA= fichero etiquetado)
 ifneq ($(DATA),)

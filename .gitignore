@@ -28,3 +28,5 @@ models/
 .claude/settings.local.json
 # Backups y datos locales de verificacion
 backup/
+# Copia de trabajo de mutmut 3 (`make mutation`)
+mutants/
