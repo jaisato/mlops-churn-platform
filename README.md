@@ -192,7 +192,7 @@ Qué cubren (431 tests en 18 módulos, cobertura de líneas y ramas del 100 %):
 
 ## 🔁 CI/CD (GitHub Actions)
 
-- **`ci.yml`** en cada push/PR: `ruff` (reglas y formato) + `mypy` + `shellcheck`/`actionlint`/`hadolint` → `pytest` en Python 3.11, 3.12 y 3.13 con cobertura mínima del 90 % → `pip-audit` sobre el lockfile de producción → validación de los ficheros compose y build de la imagen.
+- **`ci.yml`** en cada push/PR: `ruff` (reglas y formato) + `mypy` + `shellcheck`/`actionlint`/`hadolint` → `pytest` en Python 3.11, 3.12 y 3.13 con cobertura mínima del 90 % (cada versión repite `mypy` con su intérprete: `tests/test_typecheck.py`) → `pip-audit` sobre el lockfile de producción → validación de los ficheros compose y build de la imagen.
 - **`deploy.yml`** (tag `vX.Y.Z`): build → push a **GHCR** (`X.Y.Z`, `sha-…` y `latest`) → túnel **WireGuard** → SSH al VPS con huella fijada → `deploy/scripts/deploy.sh` (pull, up, espera a `/health`, entrenamiento inicial si el volumen está vacío, rollback automático si la API no responde).
 - **Dependencias fijadas** en `requirements.lock` / `requirements-dev.lock` (generados con `uv`, `make lock`) y vigiladas por Dependabot.
 
