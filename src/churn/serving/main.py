@@ -318,6 +318,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return model
 
     def _require_admin(token: str) -> None:
+        # Fuera de produccion se admite CHURN_ADMIN_TOKEN vacio, y compare_digest(b"", b"") es
+        # True: una peticion SIN cabecera pasaba por administrador (reload, rollback a cualquier
+        # version y POST /labels, que alimenta el reentreno). Vacio = administracion cerrada.
+        if not settings.admin_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Administracion deshabilitada: CHURN_ADMIN_TOKEN no esta definido",
+            )
         # compare_digest: comparacion en tiempo constante (no filtra el token por timing)
         if not secrets.compare_digest(token.encode(), settings.admin_token.encode()):
             raise HTTPException(status_code=401, detail="Token de administracion invalido")

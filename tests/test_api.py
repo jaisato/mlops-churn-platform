@@ -248,6 +248,26 @@ def test_model_reload_token_incorrecto_401(client):
     assert resp.status_code == 401
 
 
+def test_admin_token_vacio_cierra_la_administracion(tmp_path):
+    """Fuera de produccion se admite CHURN_ADMIN_TOKEN="" y compare_digest(b"", b"") es True:
+    antes una peticion SIN cabecera pasaba por administrador (aqui daba 404/409/200)."""
+    from fastapi.testclient import TestClient
+
+    from churn.serving.main import create_app
+    from tests.conftest import make_settings
+
+    app = create_app(make_settings(str(tmp_path / "vacio"), admin_token=""))
+    with TestClient(app) as c:
+        sin_cabecera = [
+            c.post("/model/reload"),
+            c.post("/model/rollback"),
+            c.post("/labels", json={"labels": [{"prediction_id": "x", "churn": 1}]}),
+            c.post("/model/reload", headers={"X-Admin-Token": ""}),
+        ]
+    assert [r.status_code for r in sin_cabecera] == [401, 401, 401, 401]
+    assert "deshabilitada" in sin_cabecera[0].json()["detail"]
+
+
 def test_reload_carga_nueva_version(client_factory, train_small):
     c, model_dir = client_factory(seed=41)
     v1 = c.get("/health").json()["model_version"]
