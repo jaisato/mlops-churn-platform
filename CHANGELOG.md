@@ -33,6 +33,8 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/); vers
 - `deploy/scripts/backup.sh` archivaba `drift.sqlite` (modo WAL, escrito en cada prediccion) con un `tar` en caliente, que puede copiar la base y su `-wal` en instantes distintos: con escrituras continuas, 15 de 15 copias resultaron corruptas. Ahora hace una instantanea consistente con la API de backup de SQLite (en un contenedor de la propia imagen, sin parar la API) que guarda aparte como `drift-<STAMP>.sqlite`, y el `.tgz` del volumen excluye los ficheros vivos; la restauracion documentada la incluye.
 
 ### Seguridad
+- `CHURN_ADMIN_TOKEN` sin definir, vacio o en blanco deja la administracion cerrada (401 en `/model/reload`, `/model/rollback` y `/labels` sin `CHURN_LABELS_TOKEN`). Fuera de produccion, un token vacio dejaba pasar como administrador una peticion sin cabecera (`compare_digest(b"", b"")` es True), y sin definir valia el `cambia-este-token` del codigo, que es publico.
+- `opentelemetry-api`/`-sdk` 1.45.1 -> 1.45.2 en los lockfiles (CVE-2026-126360, via `mlflow-skinny`).
 - `deploy.yml`: el tag del despliegue manual y los secretos llegan a los scripts por `env`, y el tag se valida (`latest`, `X.Y.Z[-pre]` o `sha-<hash>`) antes de viajar en el comando remoto de ssh. Antes se interpolaban con `${{ }}` dentro de `run:`, lo que permitia inyectar comandos en el runner y en el VPS a quien pudiera lanzar el workflow.
 - `X-Request-ID` del cliente solo se propaga (a la respuesta y a los logs) si es un identificador de 1-128 caracteres `[A-Za-z0-9._:-]`; cualquier otro valor se sustituye por uno generado, para que una cabecera de varios KB no infle cada linea de log.
 - `werkzeug` 3.1.8 -> 3.1.9 en los lockfiles (PYSEC-2026-4312).

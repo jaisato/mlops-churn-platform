@@ -72,8 +72,9 @@ class Settings(BaseSettings):
     # (`python -m churn.data.labels`); nunca por debajo del minimo del validador de entrenamiento
     labels_min_rows: int = Field(default=MIN_ROWS, ge=MIN_ROWS)
 
-    # Token para operaciones administrativas (/model/reload, /model/rollback)
-    admin_token: str = "cambia-este-token"
+    # Token para operaciones administrativas (/model/reload, /model/rollback). Sin definir (o
+    # vacio) la administracion queda cerrada: un valor por defecto publico la abria fuera de prod.
+    admin_token: str = ""
     # Token propio de POST /labels (cabecera X-Labels-Token): el job del CRM que devuelve las
     # etiquetas no necesita poder recargar ni hacer rollback del modelo. Vacio = /labels exige
     # el token de administracion (X-Admin-Token), como /model/reload.
