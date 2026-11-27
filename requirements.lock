@@ -169,7 +169,7 @@ pydantic==2.14.3
     #   pydantic-settings
 pydantic-core==2.50.4
     # via pydantic
-pydantic-settings==2.16.2
+pydantic-settings==2.16.3
     # via -r requirements.txt
 pyparsing==3.3.2
     # via matplotlib
