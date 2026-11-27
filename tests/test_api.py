@@ -268,6 +268,37 @@ def test_admin_token_vacio_cierra_la_administracion(tmp_path):
     assert "deshabilitada" in sin_cabecera[0].json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "ajuste",
+    [{"admin_token": "   "}, {"admin_token": "\t"}, {}],
+    ids=["espacios", "tab", "ausente"],
+)
+def test_admin_token_en_blanco_o_ausente_cierra_la_administracion(tmp_path, monkeypatch, ajuste):
+    """Un token de solo espacios pasaba con esa misma cabecera, y sin CHURN_ADMIN_TOKEN valia el
+    "cambia-este-token" del codigo, que es publico: los dos cierran la administracion."""
+    from fastapi.testclient import TestClient
+
+    from churn.config import Settings
+    from churn.serving.main import create_app
+
+    monkeypatch.delenv("CHURN_ADMIN_TOKEN", raising=False)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        model_dir=str(tmp_path / "m"),
+        drift_min_rows=10,
+        drift_store="memory",
+        **ajuste,
+    )
+    with TestClient(create_app(settings)) as c:
+        respuestas = [
+            c.post("/model/reload", headers={"X-Admin-Token": token})
+            for token in (settings.admin_token, "cambia-este-token")
+        ]
+    assert [r.status_code for r in respuestas] == [401, 401]
+    assert all("deshabilitada" in r.json()["detail"] for r in respuestas)
+
+
 def test_reload_carga_nueva_version(client_factory, train_small):
     c, model_dir = client_factory(seed=41)
     v1 = c.get("/health").json()["model_version"]

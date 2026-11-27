@@ -122,7 +122,7 @@ Sin Docker: `make install && make run` (entrena y sirve en local; requiere Pytho
 | `CHURN_DRIFT_BUFFER_SIZE` | `5000` | Ventana reciente que miran `/monitoring/drift` y `/monitoring/performance` |
 | `CHURN_DRIFT_STORE` / `CHURN_DRIFT_DB_PATH` | `sqlite` / `<model_dir>/drift.sqlite` | Dónde viven las predicciones y sus etiquetas (`memory` = por proceso, solo demos) |
 | `CHURN_PSI_ALERT_THRESHOLD` | `0.2` | Umbral de alerta PSI |
-| `CHURN_ADMIN_TOKEN` | — | Token de `/model/reload` y `/model/rollback` (y de `/labels` si no hay `CHURN_LABELS_TOKEN`); >= 16 caracteres en producción (`openssl rand -hex 32`) |
+| `CHURN_ADMIN_TOKEN` | — | Token de `/model/reload` y `/model/rollback` (y de `/labels` si no hay `CHURN_LABELS_TOKEN`); sin definir, vacío o en blanco, la administración queda cerrada (401); >= 16 caracteres en producción (`openssl rand -hex 32`) |
 | `CHURN_LABELS_TOKEN` | *(vacío)* | Token propio de `POST /labels` (cabecera `X-Labels-Token`): el job del CRM que envía etiquetas no puede recargar ni hacer rollback. Si se define, `/labels` solo acepta este (no el de administración); vacío = `/labels` exige `X-Admin-Token` y la API lo avisa al arrancar en producción. Distinto del de administración y >= 16 caracteres en producción |
 | `CHURN_API_KEY` | *(vacío = abierto)* | Si se define, `/predict*`, `/model/info`, `/model/versions` y `/monitoring/*` exigen `X-API-Key` |
 | `CHURN_METRICS_ENABLED` / `CHURN_ACCESS_LOG` | `true` / `true` | `/metrics` Prometheus y una línea JSON por petición |
